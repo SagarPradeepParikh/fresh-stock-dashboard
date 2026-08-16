@@ -15,6 +15,7 @@ from urllib.parse import urljoin, urlparse
 from zoneinfo import ZoneInfo
 
 import pandas as pd
+import numpy as np
 import plotly.graph_objects as go
 import requests
 import streamlit as st
@@ -54,6 +55,7 @@ st.markdown("""<style>
 div[data-testid="stMetric"] { background: rgba(12, 20, 47, .72); border: 1px solid rgba(87, 220, 255, .26); border-radius: 12px; padding: 10px; backdrop-filter: blur(4px); }
 section[data-testid="stSidebar"] { background: #111827; }
 .amber-upload { border: 2px dashed #f59e0b; border-radius: 10px; padding: 12px; background: #3a2b11; }
+div.stButton > button[kind="primary"] { background: #16a34a; border-color: #22c55e; color: white; font-weight: 700; }
 </style>""", unsafe_allow_html=True)
 
 US_UNIVERSE = {
@@ -416,6 +418,37 @@ def finnhub_quote(symbol: str, token: str | None) -> dict[str, Any]:
         return {"price": None, "previous": None, "as_of": None, "error": f"Finnhub quote request failed: {exc}"}
 
 
+@st.cache_data(ttl=900, show_spinner=False)
+def price_history(symbol: str, market: str, token: str | None) -> pd.DataFrame:
+    """Return a one-year chart independently of the live-quote provider.
+
+    Finnhub is tried first for US symbols when configured. Yahoo is retained as
+    a read-only fallback, so a Finnhub live quote never removes the chart.
+    """
+    if market == "US" and token:
+        try:
+            end = int(dt.datetime.now(dt.timezone.utc).timestamp())
+            start = end - 370 * 24 * 60 * 60
+            response = requests.get(
+                "https://finnhub.io/api/v1/stock/candle",
+                params={"symbol": symbol, "resolution": "D", "from": start, "to": end, "token": token},
+                timeout=15,
+            )
+            response.raise_for_status()
+            payload = response.json()
+            if payload.get("s") == "ok" and payload.get("t") and payload.get("c"):
+                return pd.DataFrame({"Close": payload["c"]}, index=pd.to_datetime(payload["t"], unit="s", utc=True))
+        except (requests.RequestException, ValueError, TypeError):
+            pass
+    try:
+        history = yf.Ticker(symbol).history(period="1y", interval="1d", auto_adjust=False, actions=False)
+        if history is None or history.empty or "Close" not in history:
+            return pd.DataFrame()
+        return history[["Close"]].dropna()
+    except Exception:
+        return pd.DataFrame()
+
+
 @st.cache_data(ttl=14400, show_spinner=False)
 def yahoo_fundamentals(symbol: str) -> dict[str, Any]:
     """Server-side four-hour cache for ratios and statements; never creates substitute data."""
@@ -714,7 +747,7 @@ def deterministic_disclosure_evidence(source_urls: tuple[str, ...], market: str,
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def resolve_investor_relations(website: str) -> dict[str, str | None]:
-    """Find an investor-relations link only by crawling the company's reported official site."""
+    """Find IR from the official domain, including common issuer-owned routes."""
     if not website or not website.startswith(("http://", "https://")):
         return {"website": website, "ir_url": None, "error": "No official website was supplied by the data provider."}
     try:
@@ -729,7 +762,13 @@ def resolve_investor_relations(website: str) -> dict[str, str | None]:
                 candidate = urljoin(website, href)
                 if urlparse(candidate).netloc == urlparse(website).netloc:
                     return {"website": website, "ir_url": candidate, "error": None}
-        return {"website": website, "ir_url": None, "error": "No investor-relations link was found on the official homepage."}
+        base = f"{urlparse(website).scheme}://{urlparse(website).netloc}"
+        for path in ("/investors", "/investor-relations", "/investor", "/financial-information", "/annual-reports"):
+            candidate = f"{base}{path}"
+            probe = requests.get(candidate, headers={"User-Agent": "Mozilla/5.0"}, timeout=10, allow_redirects=True)
+            if probe.ok and urlparse(probe.url).netloc == urlparse(website).netloc and len(probe.text) > 800:
+                return {"website": website, "ir_url": probe.url, "error": None}
+        return {"website": website, "ir_url": None, "error": "No investor-relations route was discoverable on the official domain. Use the SEC/NSE/BSE sources below or upload the issuer annual report."}
     except requests.RequestException as exc:
         return {"website": website, "ir_url": None, "error": f"Could not reach the official website: {exc}"}
 
@@ -801,11 +840,167 @@ def statement_view(frame: pd.DataFrame, title: str, conversion_factor: float | N
 
 def price_chart(history: pd.DataFrame, symbol: str, currency: str) -> None:
     if history.empty:
+        st.info("One-year price-chart data is temporarily unavailable from the configured providers.")
         return
     figure = go.Figure(go.Scatter(x=history.index, y=history["Close"], mode="lines", line={"color": "#38bdf8"}, name="Close"))
     figure.update_layout(title=f"{symbol}: one-year closing-price history", paper_bgcolor="#0b0f19", plot_bgcolor="#111827", font={"color": "#f3f4f6"}, height=380, margin={"l": 10, "r": 10, "t": 45, "b": 10})
     figure.update_yaxes(title=f"Price ({currency})", gridcolor="#374151")
     st.plotly_chart(figure, width="stretch")
+
+
+def ranking_source_links(symbol: str, market: str, company: str) -> list[tuple[str, str]]:
+    """Links to the requested third-party ranking pages; their figures remain provider-owned."""
+    clean_symbol = display_symbol(symbol)
+    company_query = company.replace(" ", "+")
+    links = [("CSIMarket live US company/industry rankings", "https://csimarket.com/screening/most_valuable.php")]
+    if market == "India":
+        links.append(("Screener.in live company page", f"https://www.screener.in/company/{clean_symbol}/consolidated/"))
+        links.append(("Screener.in company search", f"https://www.screener.in/search/?q={company_query}"))
+    else:
+        links.append(("CSIMarket live sector and industry screens", "https://csimarket.com/screening/index.php"))
+    return links
+
+
+def estimated_agm_schedule(market: str, sec_data: dict[str, Any] | None, income: pd.DataFrame) -> pd.DataFrame:
+    """Show an estimate only when there is a clearly stated source basis."""
+    rows: list[dict[str, str]] = []
+    if market == "US" and sec_data is not None and not sec_data.get("filings", pd.DataFrame()).empty:
+        proxies = sec_data["filings"].loc[sec_data["filings"]["Form"] == "DEF 14A"]
+        if not proxies.empty:
+            filed = pd.to_datetime(proxies.iloc[0]["Filed"], errors="coerce")
+            if pd.notna(filed):
+                rows.append({"Meeting": "Annual meeting / proxy season", "Past official proxy filing": filed.date().isoformat(), "Indicative next window": (filed.date() + dt.timedelta(days=365)).isoformat(), "Method": "One year after latest DEF 14A filing; confirm in the current proxy statement."})
+    if market == "India":
+        period = latest_statement_period(income)
+        if period != "Unavailable":
+            end = pd.Timestamp(period).date()
+            rows.append({"Meeting": "AGM", "Past annual statement period": end.isoformat(), "Indicative next window": (end + dt.timedelta(days=180)).isoformat(), "Method": "Statutory outer-window estimate from the latest provider statement period; issuer notice controls."})
+    return pd.DataFrame(rows)
+
+
+US_RS_PEERS = ["AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "AVGO", "JPM", "XOM", "LLY", "COST"]
+INDIA_RS_PEERS = ["RELIANCE.NS", "TCS.NS", "HDFCBANK.NS", "ICICIBANK.NS", "INFY.NS", "BHARTIARTL.NS", "ITC.NS", "LT.NS", "SBIN.NS", "HINDUNILVR.NS", "SUNPHARMA.NS"]
+
+
+def _close_from_download(downloaded: pd.DataFrame, ticker: str) -> pd.Series:
+    """Read adjusted Close from yfinance's single or multi-index download output."""
+    if downloaded.empty:
+        return pd.Series(dtype=float)
+    try:
+        if isinstance(downloaded.columns, pd.MultiIndex):
+            if ticker in downloaded.columns.get_level_values(0):
+                series = downloaded[ticker]["Close"]
+            else:
+                series = downloaded["Close"][ticker]
+        else:
+            series = downloaded["Close"]
+        return pd.to_numeric(series, errors="coerce").dropna()
+    except (KeyError, TypeError):
+        return pd.Series(dtype=float)
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def calculate_stock_rs_and_beta_engine(target_ticker: str) -> dict[str, Any]:
+    """Calculate 40/20/20/20 proxy-peer RS percentile and 60-day covariance beta.
+
+    The percentile is relative to the disclosed internal high-cap proxy pool,
+    not a claim about every listed company. Errors are returned as data so the
+    Streamlit page stays usable when a market provider throttles requests.
+    """
+    ticker = target_ticker.strip().upper()
+    india = ticker.endswith((".NS", ".BO"))
+    benchmark = "^NSEI" if india else "^GSPC"
+    pipeline = "Bharat Market Pipeline" if india else "Wall Street Pipeline"
+    peers = INDIA_RS_PEERS if india else US_RS_PEERS
+    pool = list(dict.fromkeys([ticker, *peers]))
+    print(f"[RS/Beta] {pipeline} engaged for {ticker}; benchmark={benchmark}; proxy peers={len(pool) - 1}")
+    try:
+        data = yf.download(pool + [benchmark], period="15mo", interval="1d", auto_adjust=True, progress=False, threads=True, group_by="ticker")
+        scores: dict[str, float] = {}
+        histories: dict[str, pd.Series] = {}
+        for name in pool:
+            close = _close_from_download(data, name)
+            if len(close) < 240:
+                continue
+            histories[name] = close
+            # Four non-overlapping trailing quarters, with the most recent weighted 40%.
+            values = [float(close.iloc[-1] / close.iloc[-64] - 1), float(close.iloc[-64] / close.iloc[-127] - 1), float(close.iloc[-127] / close.iloc[-190] - 1), float(close.iloc[-190] / close.iloc[-253] - 1)]
+            scores[name] = 0.40 * values[0] + 0.20 * values[1] + 0.20 * values[2] + 0.20 * values[3]
+        if ticker not in scores:
+            return {"ok": False, "Pipeline": pipeline, "Benchmark": benchmark, "error": "Insufficient price history: at least 240 active trading rows are required for the selected ticker."}
+        if len(scores) < 2:
+            return {"ok": False, "Pipeline": pipeline, "Benchmark": benchmark, "error": "Insufficient active proxy-peer price histories to calculate a percentile."}
+        ordered = sorted(scores.items(), key=lambda item: item[1])
+        rank = next(index + 1 for index, item in enumerate(ordered) if item[0] == ticker)
+        rs = int(round(1 + ((rank - 1) / (len(ordered) - 1)) * 98))
+        asset_returns = histories[ticker].pct_change().dropna().tail(60)
+        benchmark_close = _close_from_download(data, benchmark)
+        benchmark_returns = benchmark_close.pct_change().dropna().tail(60)
+        paired = pd.concat([asset_returns.rename("asset"), benchmark_returns.rename("benchmark")], axis=1).dropna().tail(60)
+        if len(paired) < 40 or float(np.var(paired["benchmark"], ddof=1)) == 0:
+            return {"ok": False, "Pipeline": pipeline, "Benchmark": benchmark, "error": "Insufficient aligned 60-day benchmark history to calculate beta."}
+        beta = float(np.cov(paired["asset"], paired["benchmark"], ddof=1)[0, 1] / np.var(paired["benchmark"], ddof=1))
+        if rs >= 85 and beta < 1.10:
+            signal = "🔥 EXPLOSIVE HOLY GRAIL DECOUPLING"
+        elif rs >= 80:
+            signal = "🚀 Outperforming Momentum Trend"
+        elif rs <= 30:
+            signal = "⚠️ Severe Capital Underperformance Track"
+        else:
+            signal = "Normal Structural Performance Market Track"
+        return {"ok": True, "Pipeline": pipeline, "Benchmark": benchmark, "RS Percentile Rating": rs, "Recent 60-Day Beta": beta, "System Diagnostic Signal": signal, "Proxy peer observations": len(scores), "Weighted raw score": scores[ticker]}
+    except Exception as exc:
+        return {"ok": False, "Pipeline": pipeline, "Benchmark": benchmark, "error": f"RS/Beta provider request failed: {exc}"}
+
+
+def _net_income_row(income: pd.DataFrame) -> pd.Series:
+    for label in ("Net Income", "Net Income Common Stockholders", "Net Income Including Noncontrolling Interests", "Normalized Income"):
+        if label in income.index:
+            return pd.to_numeric(income.loc[label], errors="coerce")
+    return pd.Series(dtype=float)
+
+
+@st.cache_data(ttl=14_400, show_spinner=False)
+def pat_and_market_price_table(symbol: str, income_json: str, market: str) -> pd.DataFrame:
+    """Return five fiscal-year PAT growth and end-year share-price proxy.
+
+    Product selling prices are not universally disclosed in structured feeds;
+    the price field is explicitly a market-share-price proxy and never labelled
+    as a product price.
+    """
+    income = _frame_from_cache(income_json)
+    net_income = _net_income_row(income)
+    if net_income.empty:
+        return pd.DataFrame()
+    try:
+        history = yf.Ticker(symbol).history(period="6y", interval="1d", auto_adjust=True, actions=False)["Close"].dropna()
+    except Exception:
+        history = pd.Series(dtype=float)
+    records = []
+    annual_values = []
+    for column, raw_value in net_income.items():
+        try:
+            end = pd.Timestamp(column)
+        except (TypeError, ValueError):
+            continue
+        value = num(raw_value)
+        if value is not None:
+            annual_values.append((end, value))
+    for end, value in sorted(annual_values, key=lambda item: item[0])[-5:]:
+        if value is None:
+            continue
+        before = history.loc[:pd.Timestamp(end).tz_localize(history.index.tz) if getattr(history.index, "tz", None) else pd.Timestamp(end)] if not history.empty else pd.Series(dtype=float)
+        close = float(before.iloc[-1]) if not before.empty else None
+        records.append({"FY": str(end.year), "PAT (reported currency M)": value / 1_000_000, "Market share-price proxy": close})
+    if not records:
+        return pd.DataFrame()
+    table = pd.DataFrame(records)
+    table["PAT % increase"] = table["PAT (reported currency M)"].pct_change() * 100
+    table["Market share-price % rise"] = table["Market share-price proxy"].pct_change() * 100
+    table["Multiplier"] = table.apply(lambda row: row["PAT % increase"] / row["Market share-price % rise"] if pd.notna(row["PAT % increase"]) and pd.notna(row["Market share-price % rise"]) and row["Market share-price % rise"] != 0 else np.nan, axis=1)
+    threshold = 2.0 if market == "India" else 1.5
+    table["Multiplier status"] = table["Multiplier"].map(lambda value: "Green" if pd.notna(value) and value >= threshold else ("Amber" if pd.notna(value) else "Unavailable"))
+    return table
 
 
 def render() -> None:
@@ -899,6 +1094,11 @@ def render() -> None:
     else:
         price = yahoo_price(symbol)
         price["source"] = "Yahoo Finance"
+    # Quote and chart requests are deliberately separate: a successful Finnhub
+    # quote must not leave the earlier Yahoo-only chart blank.
+    chart_history = price_history(symbol, market, finnhub_token)
+    if not chart_history.empty:
+        price["history"] = chart_history
     fundamentals, browser_cache_hit = browser_cached_fundamentals(symbol)
     info = fundamentals["info"]
     sec_data = sec_company_data(symbol, secret("SEC_USER_AGENT")) if market == "US" else None
@@ -928,6 +1128,12 @@ def render() -> None:
         }
     if price_warning:
         st.warning(price_warning)
+    if st.button("➕ Add to watchlist", type="primary", key=f"watch-top-{market}-{symbol}"):
+        if symbol not in [item["Symbol"] for item in st.session_state.watchlist]:
+            st.session_state.watchlist.append({"Symbol": symbol, "Market": market, "Company": company, "Saved at UTC": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d %H:%M")})
+            st.success("Added to watchlist.")
+        else:
+            st.info("Already in watchlist.")
     latest, previous = price.get("price"), price.get("previous")
     change = latest - previous if latest is not None and previous is not None else None
     last_filing = sec_data.get("last_filed") if sec_data else None
@@ -944,13 +1150,6 @@ def render() -> None:
         st.caption(f"Latest provider financial statement period: {latest_statement_period(fundamentals['income'])}. This is not represented as an NSE/BSE filing date; use the official exchange links in Section 4 for issuer filings.")
     price_chart(price["history"], symbol, currency)
     st.caption(f"All absolute financial values below are presented in USD millions. FX basis: {fx_note}. Ratios are not converted.")
-    if st.button("Add to watchlist"):
-        if symbol not in [item["Symbol"] for item in st.session_state.watchlist]:
-            st.session_state.watchlist.append({"Symbol": symbol, "Market": market, "Company": company, "Saved at UTC": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d %H:%M")})
-            st.success("Added to watchlist.")
-        else:
-            st.info("Already in watchlist.")
-
     st.header("2. Company full name")
     st.write(company)
     st.header("3. Company business and location")
@@ -978,7 +1177,7 @@ def render() -> None:
         st.link_button("Auto-Fetch: open verified Investor Relations page", resolved["ir_url"])
     else:
         st.warning(f"Investor Relations link unavailable. {resolved.get('error', '')}")
-    st.markdown("<div class='amber-upload'>Proxy block encountered or report link unavailable? Download the official report using the link above, then drop it here for source-grounded analysis.</div>", unsafe_allow_html=True)
+    st.markdown("<div class='amber-upload'>To populate corporate group, subsidiaries, associates, promoters and related-party information, upload the latest official annual report / 10-K / 20-F / annual return or a company investor presentation. The notes titled <em>Subsidiaries</em>, <em>Related Parties</em>, <em>Promoters / Shareholding</em>, or <em>Business Combinations</em> are most useful. Proxy block encountered or report link unavailable? Download the official report using the sources below, then drop it here for source-grounded analysis.</div>", unsafe_allow_html=True)
     st.subheader("Official public filing sources")
     if market == "US":
         if sec_data and sec_data.get("browse_url"):
@@ -1018,18 +1217,25 @@ def render() -> None:
     section_7_slot = st.container()
 
     st.header("8. Investor-report facts, future prospects, litigation and M&A")
+    st.caption("Official filing/report text is used first. Gemini runs only against an official report you upload; it is never asked to invent historic, current, or future M&A.")
     display_evidence("8. Litigation, prospects and M&A", disclosure_evidence, "No matching litigation, prospect, or M&A terms were found in the limited public source pages checked.")
     if analysis and not analysis.get("error"):
         with st.expander("Optional uploaded-report analysis"):
             st.write(analysis["section_8"])
+    else:
+        st.info("Upload an annual report, 10-K/20-F, merger circular, or investor presentation in Section 4 and run the source-grounded analysis for disclosed prospects, litigation, contingent liabilities and M&A.")
+    for label, url in ranking_source_links(symbol, market, company):
+        st.link_button(f"Research source: {label}", url, key=f"ma-{label}")
 
     st.header("9. Current, past and announced partnerships")
+    st.caption("Only partnerships, collaborations, joint ventures, or alliances explicitly disclosed in the reviewed source are shown. ‘Future’ means announced, not predicted.")
     display_evidence("9. Partnerships", disclosure_evidence, "No matching partnership terms were found in the limited public source pages checked.")
     if analysis and not analysis.get("error"):
         with st.expander("Optional uploaded-report analysis"):
             st.write(analysis["section_9"])
 
     st.header("10. Key personnel, expected joins and departures")
+    st.caption("Personnel information is limited to appointments, resignations, retirements and planned changes stated in filings, official announcements or your uploaded official source.")
     display_evidence("10. Key personnel", disclosure_evidence, "No matching executive appointment or departure terms were found in the limited public source pages checked.")
     if analysis and not analysis.get("error"):
         with st.expander("Optional uploaded-report analysis"):
@@ -1037,6 +1243,35 @@ def render() -> None:
 
     st.header("11. Past, present and forward bottleneck assessment")
     st.caption("This is a transparent, logarithmically normalised disclosed-language heuristic, not an investment recommendation or verified economic forecast.")
+    st.subheader("Five-year PAT and market-price proxy multiplier")
+    st.caption("PAT uses provider-reported net income. Product selling-price data is not a universal structured-data field, so the table uses a clearly labelled end-of-year market share-price proxy. Upload an official report if you need a disclosed product-price series. Green threshold: ≥1.5x for US; ≥2.0x for India.")
+    current_pat_table = pat_and_market_price_table(symbol, _frame_to_cache(fundamentals["income"]), market)
+    if current_pat_table.empty:
+        st.info("The provider did not return five-year annual net-income data for a PAT multiplier table.")
+    else:
+        def multiplier_style(value: Any) -> str:
+            return "background-color: #166534; color: white" if value == "Green" else ("background-color: #b45309; color: white" if value == "Amber" else "")
+        st.dataframe(current_pat_table.style.map(multiplier_style, subset=["Multiplier status"]).format({"PAT (reported currency M)": "{:,.2f}", "Market share-price proxy": "{:,.2f}", "PAT % increase": "{:.2f}%", "Market share-price % rise": "{:.2f}%", "Multiplier": "{:.2f}x"}, na_rep="Unavailable"), width="stretch", hide_index=True)
+    if st.session_state.dual_listing != "Custom ticker":
+        other_market = "India" if market == "US" else "US"
+        other_symbol = symbol_for_market(DUAL_LISTINGS[st.session_state.dual_listing][other_market], other_market)
+        other_fundamentals = yahoo_fundamentals(other_symbol)
+        other_table = pat_and_market_price_table(other_symbol, _frame_to_cache(other_fundamentals["income"]), other_market)
+        st.subheader(f"Dual-listed reference: {other_market} ({other_symbol})")
+        if other_table.empty:
+            st.info("No usable five-year annual net-income history was returned for the other listing.")
+        else:
+            st.dataframe(other_table.style.map(multiplier_style, subset=["Multiplier status"]).format({"PAT (reported currency M)": "{:,.2f}", "Market share-price proxy": "{:,.2f}", "PAT % increase": "{:.2f}%", "Market share-price % rise": "{:.2f}%", "Multiplier": "{:.2f}x"}, na_rep="Unavailable"), width="stretch", hide_index=True)
+    st.subheader("Relative Strength and 60-day covariance beta")
+    rs_beta = calculate_stock_rs_and_beta_engine(symbol)
+    if rs_beta.get("ok"):
+        rs_col, beta_col, signal_col = st.columns(3)
+        rs_col.metric("RS percentile rating", f"{rs_beta['RS Percentile Rating']} / 99")
+        beta_col.metric("Recent 60-day beta", f"{rs_beta['Recent 60-Day Beta']:.2f}")
+        signal_col.metric("System diagnostic signal", rs_beta["System Diagnostic Signal"])
+        st.caption(f"{rs_beta['Pipeline']} • Benchmark: {rs_beta['Benchmark']} • Proxy peer observations: {rs_beta['Proxy peer observations']} • 40/20/20/20 quarterly weighted return score: {rs_beta['Weighted raw score']:.2%}. The percentile is against this transparent high-cap proxy pool, not the complete market.")
+    else:
+        st.info(f"RS/Beta engine unavailable: {rs_beta.get('error', 'Unknown provider error')} ({rs_beta.get('Pipeline', 'routing unavailable')}).")
     with st.expander("Definitions used by this scale"):
         display_line_items([(label, definition) for label, definition in BOTTLENECK_DEFINITIONS.items()])
     past_column, present_column, future_column = st.columns(3)
@@ -1068,8 +1303,10 @@ def render() -> None:
 
     with section_5_slot:
         st.header("5. Market and industry position")
-        st.info("Public exchange sites provide listings and index context, but they do not expose a complete free, machine-readable peer-ranking universe. This dashboard therefore links the authoritative source pages and does not fabricate rank or peer averages.")
+        st.info("Live rankings are provider-owned and can use different reporting periods. The requested CSIMarket/Screener pages are linked below. The dashboard will not invent a numeric rank when a provider does not return a verified company match.")
         display_evidence("5. Market and industry position", disclosure_evidence, "No market-position terms were found in the limited public source pages checked. A numeric industry rank is not inferred.")
+        source_rows = pd.DataFrame([{"Provider": label, "Live ranking / company page": url, "Status": "Open provider page for latest published ranking"} for label, url in ranking_source_links(symbol, market, company)])
+        st.dataframe(source_rows, width="stretch", hide_index=True, column_config={"Live ranking / company page": st.column_config.LinkColumn("Live ranking / company page")})
         for label, url in official_exchange_links(symbol, market).items():
             st.link_button(f"Open source: {label}", url, key=f"comparison-{label}")
     section_7_slot.header("7. Company financial ratios, P&L, balance sheet and cash flow")
