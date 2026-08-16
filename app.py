@@ -6,7 +6,9 @@ import base64
 import hashlib
 import io
 import json
+import math
 import re
+import time
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urljoin, urlparse
@@ -41,13 +43,15 @@ def public_background_data_url(url: str) -> str | None:
 
 
 background_image = public_background_data_url(BACKGROUND_SHARE_URL)
+chart_art = "linear-gradient(115deg, transparent 0 18%, rgba(0,234,255,.18) 18.2% 18.5%, transparent 18.7% 33%, rgba(255,51,197,.16) 33.2% 33.6%, transparent 33.8% 51%, rgba(255,197,61,.16) 51.2% 51.5%, transparent 51.7% 100%), radial-gradient(circle at 12% 20%, rgba(0,234,255,.3) 0 2px, transparent 3px), radial-gradient(circle at 72% 70%, rgba(255,61,180,.24) 0 2px, transparent 3px)"
 background_css = (
-    f"background-image: linear-gradient(rgba(11,15,25,.88), rgba(11,15,25,.88)), url('{background_image}');"
-    if background_image else "background-color: #0b0f19;"
+    f"background-image: {chart_art}, linear-gradient(rgba(6,10,31,.82), rgba(6,10,31,.92)), url('{background_image}');"
+    if background_image else f"background-image: {chart_art}; background-color: #060a1f;"
 )
 
 st.markdown("""<style>
-.stApp { """ + background_css + """ background-attachment: fixed; background-size: cover; background-position: center; color: #f3f4f6; }
+.stApp { """ + background_css + """ background-attachment: fixed; background-size: 100% 100%, 54px 54px, 72px 72px, 100% 100%, cover; background-position: center; color: #f3f4f6; overflow-x: hidden; }
+div[data-testid="stMetric"] { background: rgba(12, 20, 47, .72); border: 1px solid rgba(87, 220, 255, .26); border-radius: 12px; padding: 10px; backdrop-filter: blur(4px); }
 section[data-testid="stSidebar"] { background: #111827; }
 .amber-upload { border: 2px dashed #f59e0b; border-radius: 10px; padding: 12px; background: #3a2b11; }
 </style>""", unsafe_allow_html=True)
@@ -97,6 +101,32 @@ def symbol_for_market(ticker: str, market: str) -> str:
 
 def display_symbol(symbol: str) -> str:
     return symbol.removesuffix(".NS")
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def company_name_matches(query: str, market: str) -> list[dict[str, str]]:
+    """Return real Yahoo Finance search matches for a company name or ticker."""
+    if len(query.strip()) < 2:
+        return []
+    try:
+        quotes = yf.Search(query.strip(), max_results=15, news_count=0).quotes or []
+    except Exception:
+        return []
+    matches = []
+    seen = set()
+    for quote in quotes:
+        symbol = str(quote.get("symbol", "")).upper()
+        name = str(quote.get("longname") or quote.get("shortname") or "")
+        exchange = str(quote.get("exchDisp") or quote.get("exchange") or "")
+        country = str(quote.get("country") or "")
+        if not symbol or symbol in seen or quote.get("quoteType") not in {"EQUITY", "MUTUALFUND", None}:
+            continue
+        india_match = symbol.endswith(".NS") or country.lower() == "india" or "nse" in exchange.lower()
+        if (market == "India" and not india_match) or (market == "US" and india_match):
+            continue
+        seen.add(symbol)
+        matches.append({"symbol": symbol, "name": name or symbol, "exchange": exchange or "Unavailable"})
+    return matches
 
 
 def num(value: Any) -> float | None:
@@ -159,6 +189,143 @@ def usd_millions(value: Any, conversion_factor: float | None) -> str:
     if value is None or conversion_factor is None:
         return "Unavailable"
     return f"${(value * conversion_factor / 1_000_000):,.2f}M"
+
+
+def display_line_items(items: list[tuple[str, Any]]) -> None:
+    """Render readable labels and values one per line, including on mobile."""
+    for label, value in items:
+        st.markdown(f"**{label}:** {value}")
+
+
+def display_evidence(section: str, evidence: dict[str, list[dict[str, str]]], empty_message: str) -> None:
+    """Display deterministic source excerpts with clickable source URLs."""
+    rows = evidence.get(section, [])
+    if rows:
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True, column_config={"Source": st.column_config.LinkColumn("Source")})
+    else:
+        st.info(empty_message)
+
+
+BOTTLENECK_DEFINITIONS = {
+    "Bottleneck": "Demand is high relative to available supply, so the relevant raw material, product, service, or by-product may become constrained and prices may rise.",
+    "At par": "Demand and supply are broadly balanced; price movement is limited or mainly reflects general inflation or deflation.",
+    "Eased out": "Supply or availability is high relative to demand, which can contribute to lower prices.",
+}
+
+
+def _document_text(url: str, headers: dict[str, str]) -> str:
+    try:
+        response = requests.get(url, headers=headers, timeout=15)
+        response.raise_for_status()
+        content_type = response.headers.get("Content-Type", "").lower()
+        if "pdf" in content_type or url.lower().endswith(".pdf"):
+            reader = PdfReader(io.BytesIO(response.content))
+            return " ".join(reader.pages[index].extract_text() or "" for index in range(min(30, len(reader.pages))))
+        return BeautifulSoup(response.text, "html.parser").get_text(" ", strip=True)
+    except (requests.RequestException, ValueError, OSError):
+        return ""
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def supply_demand_assessments(source_urls: tuple[str, ...], market: str, sec_user_agent: str | None) -> dict[str, dict[str, Any]]:
+    """Create a disclosed-language heuristic, without making an investment forecast."""
+    headers = {"User-Agent": sec_user_agent} if market == "US" and sec_user_agent else {"User-Agent": "Mozilla/5.0"}
+    source_text = " ".join(_document_text(url, headers) for url in source_urls[:3])
+    time.sleep(0.12 if market == "US" else 0.25)
+    sentences = re.split(r"(?<=[.!?])\s+", re.sub(r"\s+", " ", source_text))
+    periods = {
+        "Past": ("previous", "prior", "historical", "formerly", "year ended"),
+        "Present": ("current", "currently", "today", "now", "ongoing"),
+        "Future": ("expect", "expected", "outlook", "forecast", "will", "anticipate", "future"),
+    }
+    positive = ("shortage", "supply constraint", "constrained supply", "capacity constraint", "supply disruption", "high demand", "demand exceeded", "backlog", "price increase")
+    negative = ("oversupply", "excess capacity", "weak demand", "demand decline", "inventory build", "price decline", "supply glut", "overcapacity")
+    neutral = ("balanced supply", "stable demand", "stable pricing", "normalized", "normalised", "equilibrium")
+    result = {}
+    for period, markers in periods.items():
+        relevant = [sentence for sentence in sentences if any(marker in sentence.lower() for marker in markers)]
+        text = " ".join(relevant) if relevant else source_text
+        high = sum(text.lower().count(term) for term in positive)
+        low = sum(text.lower().count(term) for term in negative)
+        balanced = sum(text.lower().count(term) for term in neutral)
+        raw_score = high - low
+        # Signed logarithmic normalization: -100 (eased-out) to +100 (bottleneck).
+        score = 0.0 if raw_score == 0 else (math.copysign(math.log1p(abs(raw_score)) / math.log(6) * 100, raw_score))
+        score = max(-100.0, min(100.0, score))
+        if not source_text:
+            classification = "Insufficient public source text"
+        elif score >= 25:
+            classification = "Bottleneck evidence"
+        elif score <= -25:
+            classification = "Eased-out evidence"
+        elif balanced or raw_score == 0:
+            classification = "At-par / inconclusive evidence"
+        else:
+            classification = "At-par / inconclusive evidence"
+        result[period] = {"score": score, "classification": classification, "high": high, "low": low, "balanced": balanced}
+    return result
+
+
+def supply_demand_gauge(period: str, result: dict[str, Any]) -> None:
+    """Show the red-left, amber-centre, green-right logarithmic evidence scale."""
+    figure = go.Figure(go.Indicator(
+        mode="gauge+number",
+        value=result["score"],
+        number={"suffix": "", "font": {"size": 28, "color": "white"}},
+        title={"text": f"{period}<br><span style='font-size:0.75em'>{result['classification']}</span>", "font": {"color": "white", "size": 16}},
+        gauge={
+            "axis": {"range": [-100, 100], "tickvals": [-100, 0, 100], "ticktext": ["Eased out", "At par", "Bottleneck"], "tickcolor": "white"},
+            "bar": {"color": "white"},
+            "bgcolor": "rgba(0,0,0,0)",
+            "steps": [
+                {"range": [-100, -25], "color": "#dc2626"},
+                {"range": [-25, 25], "color": "#f59e0b"},
+                {"range": [25, 100], "color": "#16a34a"},
+            ],
+        },
+    ))
+    figure.update_layout(height=260, margin={"l": 15, "r": 15, "t": 55, "b": 5}, paper_bgcolor="rgba(0,0,0,0)", font={"color": "white"})
+    st.plotly_chart(figure, use_container_width=True, config={"displayModeBar": False})
+    st.caption(f"Disclosed-language counts — bottleneck: {result['high']}; eased-out: {result['low']}; at-par: {result['balanced']}.")
+
+
+def deterministic_supply_brief(assessment: dict[str, dict[str, Any]], evidence: dict[str, list[dict[str, str]]]) -> str:
+    """Produce a sub-400-word explanation without an AI model."""
+    readings = "; ".join(f"{period}: {result['classification']} (score {result['score']:.0f})" for period, result in assessment.items())
+    excerpts = evidence.get("11. Supply-demand evidence", [])[:2]
+    source_note = " ".join(f"Source excerpt: {item['Evidence excerpt'][:300]}" for item in excerpts)
+    text = (
+        f"The gauge is based on a logarithmically normalised count of supply-demand language in the selected public filings or Investor Relations pages. "
+        f"Readings are {readings}. Terms such as shortage, constrained supply, high demand and backlog move the indicator right toward bottleneck; "
+        f"oversupply, excess capacity, weak demand and inventory build move it left toward eased out; balanced supply, stable demand and normalised pricing support the centre. "
+        f"The result is evidence-based, not a price forecast. Geopolitical effects are included only where the selected official source explicitly mentions them. {source_note}"
+    )
+    return " ".join(text.split()[:400])
+
+
+def ai_supply_brief(company: str, assessment: dict[str, dict[str, Any]], evidence: dict[str, list[dict[str, str]]], api_key: str | None, model: str | None, news_context: list[dict[str, Any]]) -> tuple[str | None, str | None]:
+    """Generate a concise source-bound explanation using an optional Gemini key."""
+    if not api_key:
+        return None, "Add GEMINI_API_KEY to Streamlit secrets to generate the optional AI explanation."
+    source_rows = evidence.get("11. Supply-demand evidence", []) + evidence.get("5. Market and industry position", [])
+    source_text = "\n".join(f"SOURCE: {item['Source']}\nEXCERPT: {item['Evidence excerpt']}" for item in source_rows[:5])
+    news_text = "\n".join(f"NEWS: {item.get('headline', '')} — {item.get('summary', '')}" for item in news_context[:5])
+    prompt = f"""Write no more than 350 words for Section 11 of an equity-research dashboard about {company}.
+Explain why the disclosed-language gauge reads Past={assessment['Past']['classification']}, Present={assessment['Present']['classification']}, Future={assessment['Future']['classification']}.
+Use only the supplied official filing excerpts and provider news context. Discuss geopolitical conditions only if directly supported by those sources. Do not give investment advice, do not invent facts, and explicitly state when source evidence is insufficient.
+
+OFFICIAL SOURCES:
+{source_text or 'No usable official source excerpt.'}
+
+PROVIDER NEWS CONTEXT:
+{news_text or 'No provider news supplied.'}
+"""
+    try:
+        from google import genai
+        response = genai.Client(api_key=api_key).models.generate_content(model=model or "gemini-1.5-flash", contents=prompt)
+        return " ".join((response.text or "No AI explanation was returned.").split()[:400]), None
+    except Exception as exc:
+        return None, f"AI explanation was unavailable: {exc}"
 
 
 def market_clock() -> dict[str, dict[str, str]]:
@@ -333,7 +500,7 @@ def finnhub_profile_and_news(symbol: str, token: str | None) -> dict[str, Any]:
 
 
 SEC_FACTS = {
-    "Revenue": ("RevenueFromContractWithCustomerExcludingAssessedTax", "Revenues", "SalesRevenueNet"),
+    "Revenue": ("RevenueFromContractWithCustomerExcludingAssessedTax", "Revenues", "SalesRevenueNet", "Revenue"),
     "Gross profit": ("GrossProfit",),
     "Operating income": ("OperatingIncomeLoss",),
     "Net income": ("NetIncomeLoss", "ProfitLoss"),
@@ -347,19 +514,73 @@ SEC_FACTS = {
     "Operating cash flow": ("NetCashProvidedByUsedInOperatingActivities",),
     "Capital expenditure": ("PaymentsToAcquirePropertyPlantAndEquipment",),
 }
+SEC_STATEMENT_CONCEPTS = {
+    "Income statement": {
+        "Revenue": ("RevenueFromContractWithCustomerExcludingAssessedTax", "Revenues", "SalesRevenueNet", "Revenue"),
+        "Gross profit": ("GrossProfit",),
+        "Operating income": ("OperatingIncomeLoss",),
+        "Net income": ("NetIncomeLoss", "ProfitLoss"),
+    },
+    "Balance sheet": {
+        "Cash and cash equivalents": ("CashAndCashEquivalentsAtCarryingValue",),
+        "Current assets": ("AssetsCurrent",),
+        "Total assets": ("Assets",),
+        "Current liabilities": ("LiabilitiesCurrent",),
+        "Total liabilities": ("Liabilities",),
+        "Shareholders' equity": ("StockholdersEquity", "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest"),
+        "Long-term debt": ("LongTermDebtNoncurrent", "LongTermDebt"),
+    },
+    "Cash-flow statement": {
+        "Operating cash flow": ("NetCashProvidedByUsedInOperatingActivities",),
+        "Capital expenditure": ("PaymentsToAcquirePropertyPlantAndEquipment",),
+        "Cash dividends paid": ("PaymentsOfDividends",),
+    },
+}
 
 
 def _latest_sec_fact(facts: dict[str, Any], concepts: tuple[str, ...]) -> float | None:
     """Get a latest annual USD fact, preserving the SEC filing's reported value."""
     for concept in concepts:
-        fact = facts.get("us-gaap", {}).get(concept, {})
-        units = fact.get("units", {}).get("USD", [])
-        annual = [item for item in units if item.get("form") in {"10-K", "20-F", "40-F"} and item.get("fy")]
-        candidates = annual or units
-        if candidates:
-            item = max(candidates, key=lambda row: (row.get("end", ""), row.get("filed", "")))
-            return num(item.get("val"))
+        for taxonomy in ("us-gaap", "ifrs-full"):
+            fact = facts.get(taxonomy, {}).get(concept, {})
+            units = fact.get("units", {}).get("USD", [])
+            annual = [item for item in units if item.get("form") in {"10-K", "20-F", "40-F"} and item.get("fy")]
+            candidates = annual or units
+            if candidates:
+                item = max(candidates, key=lambda row: (row.get("end", ""), row.get("filed", "")))
+                return num(item.get("val"))
     return None
+
+
+def _annual_sec_series(facts: dict[str, Any], concepts: tuple[str, ...]) -> dict[str, str]:
+    """Return up to three annual SEC XBRL values, in original USD amounts shown as USD M."""
+    for concept in concepts:
+        for taxonomy in ("us-gaap", "ifrs-full"):
+            units = facts.get(taxonomy, {}).get(concept, {}).get("units", {}).get("USD", [])
+            annual = [item for item in units if item.get("form") in {"10-K", "20-F", "40-F"} and item.get("fy")]
+            if annual:
+                by_year = {}
+                for item in annual:
+                    year = str(item.get("fy"))
+                    if year not in by_year or item.get("filed", "") > by_year[year].get("filed", ""):
+                        by_year[year] = item
+                return {year: usd_millions(item.get("val"), 1.0) for year, item in sorted(by_year.items(), reverse=True)[:3]}
+    return {}
+
+
+def sec_statement_frames(facts: dict[str, Any]) -> dict[str, pd.DataFrame]:
+    """Build standardised annual SEC statement tables without commercial intermediaries."""
+    tables = {}
+    for statement_name, rows in SEC_STATEMENT_CONCEPTS.items():
+        table_rows = []
+        years = set()
+        for label, concepts in rows.items():
+            values = _annual_sec_series(facts, concepts)
+            years.update(values)
+            table_rows.append((label, values))
+        columns = ["SEC XBRL line item", *sorted(years, reverse=True)]
+        tables[statement_name] = pd.DataFrame([[label, *[values.get(year, "Unavailable") for year in columns[1:]]] for label, values in table_rows], columns=columns)
+    return tables
 
 
 @st.cache_data(ttl=900, show_spinner=False)
@@ -370,14 +591,14 @@ def sec_company_data(symbol: str, user_agent: str | None) -> dict[str, Any]:
     User-Agent with contact details, so the request is not attempted without it.
     """
     if not user_agent or "@" not in user_agent:
-        return {"error": "Set SEC_USER_AGENT in Streamlit secrets, for example: Your App Name contact@example.com.", "facts": pd.DataFrame(), "filings": pd.DataFrame(), "browse_url": None, "last_filed": None}
+        return {"error": "Set SEC_USER_AGENT in Streamlit secrets, for example: Your App Name contact@example.com.", "facts": pd.DataFrame(), "filings": pd.DataFrame(), "statements": {}, "browse_url": None, "last_filed": None}
     headers = {"User-Agent": user_agent, "Accept-Encoding": "gzip, deflate", "Host": "data.sec.gov"}
     try:
         tickers_response = requests.get("https://www.sec.gov/files/company_tickers.json", headers={"User-Agent": user_agent}, timeout=15)
         tickers_response.raise_for_status()
         matches = [record for record in tickers_response.json().values() if record.get("ticker", "").upper() == symbol.upper()]
         if not matches:
-            return {"error": "This ticker was not found in the SEC's company ticker file.", "facts": pd.DataFrame(), "filings": pd.DataFrame(), "browse_url": None, "last_filed": None}
+            return {"error": "This ticker was not found in the SEC's company ticker file.", "facts": pd.DataFrame(), "filings": pd.DataFrame(), "statements": {}, "browse_url": None, "last_filed": None}
         record = matches[0]
         cik = str(record["cik_str"]).zfill(10)
         facts_response = requests.get(f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json", headers=headers, timeout=20)
@@ -394,9 +615,9 @@ def sec_company_data(symbol: str, user_agent: str | None) -> dict[str, Any]:
                 filing_rows.append({"Form": form, "Filed": filed, "Official SEC filing": f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{accession_path}/{document}"})
             if len(filing_rows) == 12:
                 break
-        return {"error": None, "facts": pd.DataFrame(rows), "filings": pd.DataFrame(filing_rows), "browse_url": f"https://www.sec.gov/edgar/browse/?CIK={cik}", "company_name": facts_json.get("entityName"), "last_filed": filing_rows[0]["Filed"] if filing_rows else None}
+        return {"error": None, "facts": pd.DataFrame(rows), "filings": pd.DataFrame(filing_rows), "statements": sec_statement_frames(facts_json.get("facts", {})), "browse_url": f"https://www.sec.gov/edgar/browse/?CIK={cik}", "company_name": facts_json.get("entityName"), "last_filed": filing_rows[0]["Filed"] if filing_rows else None}
     except (requests.RequestException, ValueError, KeyError) as exc:
-        return {"error": f"SEC public-data request failed: {exc}", "facts": pd.DataFrame(), "filings": pd.DataFrame(), "browse_url": None, "last_filed": None}
+        return {"error": f"SEC public-data request failed: {exc}", "facts": pd.DataFrame(), "filings": pd.DataFrame(), "statements": {}, "browse_url": None, "last_filed": None}
 
 
 def official_exchange_links(symbol: str, market: str) -> dict[str, str]:
@@ -413,6 +634,60 @@ def official_exchange_links(symbol: str, market: str) -> dict[str, str]:
         "BSE corporate announcements": "https://www.bseindia.com/corporates/ann.html",
         "BSE board meetings": "https://www.bseindia.com/corporates/board_meeting.aspx",
     }
+
+
+DISCLOSURE_KEYWORDS = {
+    "4. Group structure": ("subsidiary", "parent company", "affiliate", "related party", "promoter"),
+    "5. Market and industry position": ("market share", "largest", "competition", "competitor", "industry"),
+    "8. Litigation, prospects and M&A": ("legal proceeding", "litigation", "contingent", "acquisition", "merger", "restructuring"),
+    "9. Partnerships": ("partnership", "joint venture", "collaboration", "strategic alliance", "agreement"),
+    "10. Key personnel": ("chief executive", "chief financial officer", "appointed", "resigned", "retired", "director"),
+    "11. Supply-demand evidence": ("supply", "demand", "shortage", "capacity", "inventory", "geopolitical"),
+}
+
+
+def _keyword_snippets(text: str, keywords: tuple[str, ...], limit: int = 3) -> list[str]:
+    normalized = re.sub(r"\s+", " ", text)
+    snippets = []
+    for keyword in keywords:
+        match = re.search(re.escape(keyword), normalized, flags=re.IGNORECASE)
+        if match:
+            start = max(0, match.start() - 150)
+            end = min(len(normalized), match.end() + 270)
+            excerpt = normalized[start:end].strip()
+            if excerpt not in snippets:
+                snippets.append(excerpt)
+        if len(snippets) >= limit:
+            break
+    return snippets
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def deterministic_disclosure_evidence(source_urls: tuple[str, ...], market: str, sec_user_agent: str | None) -> dict[str, list[dict[str, str]]]:
+    """Extract disclosed keyword evidence from a few public official pages only.
+
+    This is deterministic text matching, not AI analysis. It returns evidence
+    excerpts, never inferred facts, forecasts, or a business classification.
+    """
+    results = {section: [] for section in DISCLOSURE_KEYWORDS}
+    headers = {"User-Agent": sec_user_agent} if market == "US" and sec_user_agent else {"User-Agent": "Mozilla/5.0"}
+    for url in source_urls[:3]:
+        try:
+            response = requests.get(url, headers=headers, timeout=15)
+            response.raise_for_status()
+            content_type = response.headers.get("Content-Type", "").lower()
+            if "pdf" in content_type or url.lower().endswith(".pdf"):
+                reader = PdfReader(io.BytesIO(response.content))
+                text = " ".join(reader.pages[index].extract_text() or "" for index in range(min(30, len(reader.pages))))
+            else:
+                text = BeautifulSoup(response.text, "html.parser").get_text(" ", strip=True)
+            for section, keywords in DISCLOSURE_KEYWORDS.items():
+                for snippet in _keyword_snippets(text, keywords):
+                    results[section].append({"Source": url, "Evidence excerpt": snippet})
+            time.sleep(0.12 if market == "US" else 0.25)
+        except (requests.RequestException, ValueError, OSError):
+            continue
+    return results
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -542,6 +817,20 @@ def render() -> None:
         if market != previous_market and st.session_state.dual_listing != "Custom ticker":
             st.session_state.active_ticker = DUAL_LISTINGS[st.session_state.dual_listing][market]
         st.caption("Select a dual-listed company, then switch market to load its US ticker/ADR or Indian NSE ticker.")
+        st.subheader("Company-name search")
+        name_query = st.text_input("Search company name", placeholder="Example: Apple, Infosys, Reliance")
+        possible_matches = company_name_matches(name_query, market)
+        if name_query.strip():
+            if possible_matches:
+                labels = [f"{match['name']} — {match['symbol']} ({match['exchange']})" for match in possible_matches]
+                selected_label = st.selectbox("Possible matches", labels)
+                chosen_match = possible_matches[labels.index(selected_label)]
+                if st.button("Load company match", use_container_width=True):
+                    st.session_state.active_ticker = display_symbol(chosen_match["symbol"])
+                    st.session_state.dual_listing = "Custom ticker"
+                    st.rerun()
+            else:
+                st.info("No matching listed instruments were returned by Yahoo Finance for this market.")
         universe = US_UNIVERSE if market == "US" else INDIA_UNIVERSE
         tier = st.selectbox("Company size", list(universe))
         selected = st.selectbox("Top-ten selection", universe[tier])
@@ -592,13 +881,14 @@ def render() -> None:
     change = latest - previous if latest is not None and previous is not None else None
     last_filing = sec_data.get("last_filed") if sec_data else None
     st.header("1. Company ticker, exchange and latest available stock price")
-    m1, m2, m3, m4, m5, m6 = st.columns(6)
-    m1.metric("Latest available close", money(latest, currency), f"{change:+,.2f}" if change is not None else None)
-    m2.metric("Trailing P/E", ratio(info.get("trailingPE")))
-    m3.metric("Forward P/E", ratio(info.get("forwardPE")))
-    m4.metric("Price / book", ratio(info.get("priceToBook")))
-    m5.metric("Market cap (USD M)", usd_millions(info.get("marketCap"), fx_factor))
-    m6.metric("Last official filing date", last_filing or "Unavailable")
+    display_line_items([
+        ("Ticker", symbol),
+        ("Stock exchange", info.get("fullExchangeName") or info.get("exchange") or "Unavailable"),
+        ("Latest available close", money(latest, currency)),
+        ("Daily price change", f"{change:+,.2f}" if change is not None else "Unavailable"),
+        ("Market capitalisation (absolute USD millions)", usd_millions(info.get("marketCap"), fx_factor)),
+        ("Last official filing date", last_filing or "Unavailable"),
+    ])
     if market == "India" and not last_filing:
         st.caption(f"Latest provider financial statement period: {latest_statement_period(fundamentals['income'])}. This is not represented as an NSE/BSE filing date; use the official exchange links in Section 4 for issuer filings.")
     price_chart(price["history"], symbol, currency)
@@ -613,13 +903,24 @@ def render() -> None:
     st.header("2. Company full name")
     st.write(company)
     st.header("3. Company business and location")
-    st.write({"Exchange": info.get("fullExchangeName") or info.get("exchange") or "Unavailable", "Country": info.get("country") or "Unavailable", "City": info.get("city") or "Unavailable", "Sector": info.get("sector") or "Unavailable", "Industry": info.get("industry") or "Unavailable"})
+    display_line_items([
+        ("Country", info.get("country") or "Unavailable"),
+        ("City", info.get("city") or "Unavailable"),
+        ("Sector", info.get("sector") or "Unavailable"),
+        ("Industry", info.get("industry") or "Unavailable"),
+    ])
     if info.get("longBusinessSummary"):
         st.write(info["longBusinessSummary"])
 
     st.header("4. Corporate group, subsidiaries, associates and promoters")
     website = info.get("website")
     resolved = resolve_investor_relations(website) if website else {"website": None, "ir_url": None, "error": "Provider did not return an official company website."}
+    if market == "US" and sec_data is not None and not sec_data.get("filings", pd.DataFrame()).empty:
+        evidence_urls = tuple(sec_data["filings"]["Official SEC filing"].head(3).tolist())
+    else:
+        evidence_urls = tuple(url for url in (resolved.get("ir_url"), resolved.get("website")) if url)
+    disclosure_evidence = deterministic_disclosure_evidence(evidence_urls, market, secret("SEC_USER_AGENT")) if evidence_urls else {section: [] for section in DISCLOSURE_KEYWORDS}
+    supply_assessment = supply_demand_assessments(evidence_urls, market, secret("SEC_USER_AGENT")) if evidence_urls else {period: {"score": 0.0, "classification": "Insufficient public source text", "high": 0, "low": 0, "balanced": 0} for period in ("Past", "Present", "Future")}
     if resolved.get("website"):
         st.link_button("Open company website", resolved["website"])
     if resolved.get("ir_url"):
@@ -655,75 +956,111 @@ def render() -> None:
                     progress.progress(67, text="Calculating Bottleneck State (3/3)...")
                     progress.progress(100, text="Analysis complete.")
 
+    display_evidence("4. Group structure", disclosure_evidence, "No matching group-structure terms were found in the limited public source pages checked. Open the official filings above for complete disclosure.")
     if analysis and not analysis.get("error"):
-        st.write(analysis["corporate_web"])
-    else:
-        st.info("Upload an official company or exchange report and run source-grounded analysis to populate this section.")
+        with st.expander("Optional uploaded-report analysis"):
+            st.write(analysis["corporate_web"])
+
+    # These placeholders preserve the visual chronology: 1 through 11.
+    section_5_slot = st.container()
+    section_6_slot = st.container()
+    section_7_slot = st.container()
 
     st.header("8. Investor-report facts, future prospects, litigation and M&A")
+    display_evidence("8. Litigation, prospects and M&A", disclosure_evidence, "No matching litigation, prospect, or M&A terms were found in the limited public source pages checked.")
     if analysis and not analysis.get("error"):
-        st.write(analysis["section_8"])
-    else:
-        st.info("This section requires a readable official report upload and configured Gemini analysis.")
+        with st.expander("Optional uploaded-report analysis"):
+            st.write(analysis["section_8"])
 
     st.header("9. Current, past and announced partnerships")
+    display_evidence("9. Partnerships", disclosure_evidence, "No matching partnership terms were found in the limited public source pages checked.")
     if analysis and not analysis.get("error"):
-        st.write(analysis["section_9"])
-    else:
-        st.info("This section requires a readable official report upload and configured Gemini analysis.")
+        with st.expander("Optional uploaded-report analysis"):
+            st.write(analysis["section_9"])
 
     st.header("10. Key personnel, expected joins and departures")
+    display_evidence("10. Key personnel", disclosure_evidence, "No matching executive appointment or departure terms were found in the limited public source pages checked.")
     if analysis and not analysis.get("error"):
-        st.write(analysis["section_10"])
-    else:
-        st.info("This section requires a readable official report upload and configured Gemini analysis.")
+        with st.expander("Optional uploaded-report analysis"):
+            st.write(analysis["section_10"])
 
     st.header("11. Past, present and forward bottleneck assessment")
+    st.caption("This is a transparent, logarithmically normalised disclosed-language heuristic, not an investment recommendation or verified economic forecast.")
+    with st.expander("Definitions used by this scale"):
+        display_line_items([(label, definition) for label, definition in BOTTLENECK_DEFINITIONS.items()])
+    past_column, present_column, future_column = st.columns(3)
+    with past_column:
+        supply_demand_gauge("Past", supply_assessment["Past"])
+    with present_column:
+        supply_demand_gauge("Present", supply_assessment["Present"])
+    with future_column:
+        supply_demand_gauge("Future", supply_assessment["Future"])
+    st.subheader("Why this reading appears")
+    brief_state_key = f"supply-brief:{symbol}"
+    if brief_state_key not in st.session_state:
+        st.session_state[brief_state_key] = deterministic_supply_brief(supply_assessment, disclosure_evidence)
+    if st.button("Refresh this explanation with Gemini", key=f"gemini-supply-{symbol}"):
+        news_context = []
+        if market == "US":
+            finnhub_context = finnhub_profile_and_news(symbol, secret("FINNHUB_API_KEY"))
+            news_context = finnhub_context.get("news", []) if not finnhub_context.get("error") else []
+        ai_brief, ai_error = ai_supply_brief(company, supply_assessment, disclosure_evidence, secret("GEMINI_API_KEY"), secret("GEMINI_MODEL"), news_context)
+        if ai_brief:
+            st.session_state[brief_state_key] = ai_brief
+        elif ai_error:
+            st.info(ai_error)
+    st.write(st.session_state[brief_state_key])
+    display_evidence("11. Supply-demand evidence", disclosure_evidence, "No matching supply-demand, capacity, inventory, or geopolitical terms were found in the limited public source pages checked.")
     if analysis and not analysis.get("error"):
-        st.write(analysis["bottleneck"])
-    else:
-        st.info("This section requires a readable official report upload and configured Gemini analysis.")
+        with st.expander("Optional uploaded-report analysis"):
+            st.write(analysis["bottleneck"])
 
-    st.header("5. Market and industry position")
-    st.info("Public exchange sites provide listings and index context, but they do not expose a complete free, machine-readable peer-ranking universe. This dashboard therefore links the authoritative source pages and does not fabricate rank or peer averages.")
-    for label, url in official_exchange_links(symbol, market).items():
-        st.link_button(f"Open source: {label}", url, key=f"comparison-{label}")
-    st.header("7. Company financial ratios, P&L, balance sheet and cash flow")
+    with section_5_slot:
+        st.header("5. Market and industry position")
+        st.info("Public exchange sites provide listings and index context, but they do not expose a complete free, machine-readable peer-ranking universe. This dashboard therefore links the authoritative source pages and does not fabricate rank or peer averages.")
+        display_evidence("5. Market and industry position", disclosure_evidence, "No market-position terms were found in the limited public source pages checked. A numeric industry rank is not inferred.")
+        for label, url in official_exchange_links(symbol, market).items():
+            st.link_button(f"Open source: {label}", url, key=f"comparison-{label}")
+    section_7_slot.header("7. Company financial ratios, P&L, balance sheet and cash flow")
     metrics = pd.DataFrame({"Company metric": ["Trailing P/E", "Forward P/E", "Price / book", "Return on equity", "Debt / equity", "Current ratio", "Quick ratio"], "Latest reported value": [ratio(info.get("trailingPE")), ratio(info.get("forwardPE")), ratio(info.get("priceToBook")), ratio(info.get("returnOnEquity"), True), ratio(info.get("debtToEquity")), ratio(info.get("currentRatio")), ratio(info.get("quickRatio"))]})
-    st.dataframe(metrics, use_container_width=True, hide_index=True)
+    section_7_slot.dataframe(metrics, use_container_width=True, hide_index=True)
     if market == "US":
-        st.subheader("SEC Company Facts: latest annual GAAP/IFRS XBRL facts (USD millions)")
+        section_7_slot.subheader("SEC Company Facts: latest annual GAAP/IFRS XBRL facts (USD millions)")
         if sec_data and sec_data.get("error"):
-            st.info(sec_data["error"])
+            section_7_slot.info(sec_data["error"])
         elif sec_data is not None:
-            st.dataframe(sec_data["facts"], use_container_width=True, hide_index=True)
-            st.subheader("Recent official SEC filings")
-            st.dataframe(sec_data["filings"], use_container_width=True, hide_index=True, column_config={"Official SEC filing": st.column_config.LinkColumn("Official SEC filing")})
-    statement_view(fundamentals["income"], "Annual income statement / P&L (USD millions)", fx_factor)
-    statement_view(fundamentals["balance"], "Annual balance sheet (USD millions)", fx_factor)
-    statement_view(fundamentals["cashflow"], "Annual cash-flow statement (USD millions)", fx_factor)
-    with st.expander("Quarterly statements"):
+            section_7_slot.dataframe(sec_data["facts"], use_container_width=True, hide_index=True)
+            for statement_name, statement_frame in sec_data.get("statements", {}).items():
+                section_7_slot.subheader(f"SEC XBRL annual {statement_name.lower()} (USD millions)")
+                section_7_slot.dataframe(statement_frame, use_container_width=True, hide_index=True)
+            section_7_slot.subheader("Recent official SEC filings")
+            section_7_slot.dataframe(sec_data["filings"], use_container_width=True, hide_index=True, column_config={"Official SEC filing": st.column_config.LinkColumn("Official SEC filing")})
+    with section_7_slot:
+        statement_view(fundamentals["income"], "Annual income statement / P&L (USD millions)", fx_factor)
+        statement_view(fundamentals["balance"], "Annual balance sheet (USD millions)", fx_factor)
+        statement_view(fundamentals["cashflow"], "Annual cash-flow statement (USD millions)", fx_factor)
+    with section_7_slot.expander("Quarterly statements"):
         statement_view(fundamentals["quarterly_income"], "Quarterly income statement (USD millions)", fx_factor)
         statement_view(fundamentals["quarterly_balance"], "Quarterly balance sheet (USD millions)", fx_factor)
         statement_view(fundamentals["quarterly_cashflow"], "Quarterly cash flow (USD millions)", fx_factor)
 
-    st.header("6. AGM, business meets, announcements, news and social sources")
+    section_6_slot.header("6. AGM, business meets, announcements, news and social sources")
     if analysis and not analysis.get("error"):
-        st.subheader("Official-report disclosures")
-        st.write(analysis["section_6"])
+        section_6_slot.subheader("Official-report disclosures")
+        section_6_slot.write(analysis["section_6"])
     else:
-        st.info("AGM and business-meet disclosures from reports require an official upload and Gemini analysis.")
+        section_6_slot.info("AGM and business-meet disclosures from reports require an official upload and Gemini analysis.")
     if market == "US":
         finnhub = finnhub_profile_and_news(symbol, secret("FINNHUB_API_KEY"))
         if finnhub["error"]:
-            st.info(finnhub["error"])
+            section_6_slot.info(finnhub["error"])
         for story in finnhub["news"][:10]:
-            st.markdown(f"- [{story.get('headline', 'Untitled')}]({story.get('url', '')}) — {dt.datetime.fromtimestamp(story.get('datetime', 0), dt.timezone.utc).strftime('%d %b %Y')}")
+            section_6_slot.markdown(f"- [{story.get('headline', 'Untitled')}]({story.get('url', '')}) — {dt.datetime.fromtimestamp(story.get('datetime', 0), dt.timezone.utc).strftime('%d %b %Y')}")
     else:
-        st.info("For India, use the official company Investor Relations link above and exchange disclosures. Finnhub's company-news endpoint is configured here for US symbols only.")
+        section_6_slot.info("For India, use the official company Investor Relations link above and exchange disclosures. Finnhub's company-news endpoint is configured here for US symbols only.")
     if website:
-        st.link_button("Search company posts on X", f"https://x.com/search?q={company.replace(' ', '%20')}&src=typed_query")
-    st.caption("X/Twitter posts are not ingested or analysed without an authorised X API plan. Links are provided instead of unauthenticated scraping.")
+        section_6_slot.link_button("Search company posts on X", f"https://x.com/search?q={company.replace(' ', '%20')}&src=typed_query")
+    section_6_slot.caption("X/Twitter posts are not ingested or analysed without an authorised X API plan. Links are provided instead of unauthenticated scraping.")
 
 
 if __name__ == "__main__":
