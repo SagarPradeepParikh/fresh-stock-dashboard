@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import datetime as dt
 import base64
+import calendar
 import hashlib
 import io
 import json
@@ -10,12 +11,14 @@ import math
 import re
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 from urllib.parse import urljoin, urlparse
 from zoneinfo import ZoneInfo
 
 import pandas as pd
 import numpy as np
+import pandas_market_calendars as mcal
 import plotly.graph_objects as go
 import requests
 import streamlit as st
@@ -340,6 +343,57 @@ def market_clock() -> dict[str, dict[str, str]]:
         # Regular-hours status only. Exchange holiday calendars need a licensed calendar source.
         out[name] = {"status": "🟢 OPEN" if open_now else "🔴 CLOSED", "time": local.strftime("%d %b, %I:%M %p %Z")}
     return out
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def next_30_day_market_calendar(market: str) -> pd.DataFrame:
+    """Return exchange-calendar status for each of the next 31 calendar days."""
+    start = dt.date.today()
+    end = start + dt.timedelta(days=30)
+    calendar_name = "NSE" if market == "India" else "NYSE"
+    try:
+        schedule = mcal.get_calendar(calendar_name).schedule(start_date=start, end_date=end)
+        open_days = {pd.Timestamp(day).date() for day in schedule.index}
+    except Exception:
+        # A visible fallback is preferable to claiming an unknown holiday is open.
+        open_days = set()
+    rows = []
+    for offset in range(31):
+        day = start + dt.timedelta(days=offset)
+        is_open = day in open_days
+        rows.append({"Date": day, "Day": calendar.day_name[day.weekday()], "Market status": "OPEN" if is_open else "CLOSED", "Note": "Regular session scheduled" if is_open else "Weekend, exchange holiday, or calendar data unavailable"})
+    return pd.DataFrame(rows)
+
+
+def render_market_calendar_page() -> None:
+    st.title("Market calendar: next 30 days")
+    calendar_market = st.radio("Calendar market", ["US", "India"], horizontal=True)
+    st.caption("Exchange sessions are based on the NYSE or NSE calendar. Confirm exceptional closures and special sessions with the official exchange notice.")
+    calendar_data = next_30_day_market_calendar(calendar_market)
+    st.dataframe(calendar_data, width="stretch", hide_index=True, column_config={"Date": st.column_config.DateColumn("Date", format="DD MMM YYYY")})
+    for status, color in (("OPEN", "#166534"), ("CLOSED", "#991b1b")):
+        matching = calendar_data.loc[calendar_data["Market status"] == status]
+        if not matching.empty:
+            st.markdown(f"<span style='color:{color}; font-weight:700'>{status}: {len(matching)} day(s)</span>", unsafe_allow_html=True)
+
+
+def render_market_call_audio() -> None:
+    """Offer the supplied calls when MP3s are committed beside the Streamlit app."""
+    audio_dir = Path(__file__).resolve().parent / "assets"
+    calls = [
+        ("India opening call", "Indian Opening Call.mp3"),
+        ("India closing call", "Indian Closing call.mp3"),
+        ("US opening call", "US Opening Call.mp3"),
+        ("US closing call", "US Closing call.mp3"),
+    ]
+    available = [(label, audio_dir / filename) for label, filename in calls if (audio_dir / filename).is_file()]
+    if not available:
+        return
+    with st.expander("Market opening and closing calls"):
+        st.caption("Press play to test a call. Browsers require a user interaction before playing audio.")
+        for label, path in available:
+            st.write(label)
+            st.audio(path.read_bytes(), format="audio/mpeg")
 
 
 def next_quarter_end(today: dt.date) -> dt.date:
@@ -773,6 +827,61 @@ def resolve_investor_relations(website: str) -> dict[str, str | None]:
         return {"website": website, "ir_url": None, "error": f"Could not reach the official website: {exc}"}
 
 
+def _official_report_text(url: str, market: str, sec_user_agent: str | None) -> tuple[str, str | None]:
+    """Download and extract text from a public issuer/SEC report, bounded for UI safety."""
+    headers = {"User-Agent": sec_user_agent} if market == "US" and sec_user_agent else {"User-Agent": "Mozilla/5.0"}
+    try:
+        response = requests.get(url, headers=headers, timeout=35)
+        response.raise_for_status()
+        is_pdf = "pdf" in response.headers.get("Content-Type", "").lower() or url.lower().split("?", 1)[0].endswith(".pdf")
+        if is_pdf:
+            text = "\n".join(page.extract_text() or "" for page in PdfReader(io.BytesIO(response.content)).pages)
+        else:
+            text = BeautifulSoup(response.text, "html.parser").get_text(" ", strip=True)
+        return text[:220_000], None if text.strip() else "The official report did not contain extractable text."
+    except (requests.RequestException, OSError, ValueError) as exc:
+        return "", f"Official report download failed: {exc}"
+
+
+def find_latest_official_report(resolved: dict[str, str | None], market: str, sec_data: dict[str, Any] | None) -> dict[str, str | None]:
+    """Find a latest report from SEC or the issuer's own IR domain; never from a third-party mirror."""
+    if market == "US" and sec_data is not None and not sec_data.get("filings", pd.DataFrame()).empty:
+        annual = sec_data["filings"].loc[sec_data["filings"]["Form"].isin(["10-K", "20-F", "40-F"])]
+        if not annual.empty:
+            row = annual.iloc[0]
+            return {"url": str(row["Official SEC filing"]), "label": f"Official SEC {row['Form']} filed {row['Filed']}", "error": None}
+    ir_url, website = resolved.get("ir_url"), resolved.get("website")
+    for landing_url in (ir_url, website):
+        if not landing_url:
+            continue
+        try:
+            response = requests.get(landing_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=18)
+            response.raise_for_status()
+            soup = BeautifulSoup(response.text, "html.parser")
+            candidates = []
+            for anchor in soup.find_all("a", href=True):
+                label = anchor.get_text(" ", strip=True).lower()
+                href = urljoin(landing_url, anchor["href"])
+                if urlparse(href).netloc != urlparse(landing_url).netloc:
+                    continue
+                if any(term in label or term in href.lower() for term in ("annual report", "annual-report", "financial report", "investor presentation", "annual return")):
+                    years = [int(year) for year in re.findall(r"20\d{2}", f"{label} {href}")]
+                    annual_preference = 1 if "annual" in label or "annual" in href.lower() else 0
+                    candidates.append((max(years, default=0), annual_preference, label, href))
+            if candidates:
+                candidates.sort(reverse=True)
+                return {"url": candidates[0][3], "label": "Official issuer annual / financial report", "error": None}
+        except requests.RequestException:
+            continue
+    return {"url": None, "label": None, "error": "No downloadable annual report was found on the official SEC or issuer Investor Relations pages."}
+
+
+def report_group_evidence(text: str, source_url: str) -> pd.DataFrame:
+    """Extract plain disclosed group-structure excerpts from an official report."""
+    snippets = _keyword_snippets(text, DISCLOSURE_KEYWORDS["4. Group structure"], limit=12)
+    return pd.DataFrame([{"Official report": source_url, "Group-structure excerpt": snippet} for snippet in snippets])
+
+
 def extract_uploaded_document(file) -> tuple[str, str | None]:
     """Read user-supplied official PDF, DOCX, XLSX, XLS, or CSV files locally."""
     raw = file.getvalue()
@@ -804,6 +913,7 @@ def gemini_analysis(text: str, company: str, api_key: str | None, model: str | N
         prompts = [
             ("corporate_web", "Extract only disclosed group structure: parent, subsidiaries, associates, promoter entities, related parties, their business, investment plans, and cited page/section references. If absent, state not disclosed."),
             ("disclosures", "Return valid JSON only, with these string keys: section_6, section_8, section_9, section_10. section_6 covers AGM, investor/business meets and official communications. section_8 covers investor-report facts, prospects, litigation, contingent liabilities and M&A. section_9 covers current, past and announced partnerships. section_10 covers key personnel, joins and departures. Use only disclosed facts with page/section references. State not disclosed for missing information."),
+            ("product_prices", "Return valid JSON only. Use the exact schema {\"products\":[{\"name\":string,\"unit\":string,\"currency\":string,\"prices\":[{\"fy\":string,\"price\":number,\"page\":string}]}],\"note\":string}. Extract prices only for the top three products or services explicitly identified in the report. Do not use the company share price. Do not estimate, infer, or convert revenue into price. If price series are not disclosed, return an empty products list and explain why in note."),
             ("bottleneck", "Assess past, present and forward supply-demand conditions only where the document gives evidence. Label each as bottleneck, eased-out, par, or insufficient disclosed evidence. Explain in concise bullets and cite page/section references."),
         ]
         result = {}
@@ -961,21 +1071,12 @@ def _net_income_row(income: pd.DataFrame) -> pd.Series:
 
 
 @st.cache_data(ttl=14_400, show_spinner=False)
-def pat_and_market_price_table(symbol: str, income_json: str, market: str) -> pd.DataFrame:
-    """Return five fiscal-year PAT growth and end-year share-price proxy.
-
-    Product selling prices are not universally disclosed in structured feeds;
-    the price field is explicitly a market-share-price proxy and never labelled
-    as a product price.
-    """
+def pat_growth_table(income_json: str) -> pd.DataFrame:
+    """Return reported PAT and year-over-year PAT change; no share price is used."""
     income = _frame_from_cache(income_json)
     net_income = _net_income_row(income)
     if net_income.empty:
         return pd.DataFrame()
-    try:
-        history = yf.Ticker(symbol).history(period="6y", interval="1d", auto_adjust=True, actions=False)["Close"].dropna()
-    except Exception:
-        history = pd.Series(dtype=float)
     records = []
     annual_values = []
     for column, raw_value in net_income.items():
@@ -987,20 +1088,40 @@ def pat_and_market_price_table(symbol: str, income_json: str, market: str) -> pd
         if value is not None:
             annual_values.append((end, value))
     for end, value in sorted(annual_values, key=lambda item: item[0])[-5:]:
-        if value is None:
-            continue
-        before = history.loc[:pd.Timestamp(end).tz_localize(history.index.tz) if getattr(history.index, "tz", None) else pd.Timestamp(end)] if not history.empty else pd.Series(dtype=float)
-        close = float(before.iloc[-1]) if not before.empty else None
-        records.append({"FY": str(end.year), "PAT (reported currency M)": value / 1_000_000, "Market share-price proxy": close})
+        records.append({"FY": str(end.year), "PAT (reported currency M)": value / 1_000_000})
     if not records:
         return pd.DataFrame()
     table = pd.DataFrame(records)
     table["PAT % increase"] = table["PAT (reported currency M)"].pct_change() * 100
-    table["Market share-price % rise"] = table["Market share-price proxy"].pct_change() * 100
-    table["Multiplier"] = table.apply(lambda row: row["PAT % increase"] / row["Market share-price % rise"] if pd.notna(row["PAT % increase"]) and pd.notna(row["Market share-price % rise"]) and row["Market share-price % rise"] != 0 else np.nan, axis=1)
-    threshold = 2.0 if market == "India" else 1.5
-    table["Multiplier status"] = table["Multiplier"].map(lambda value: "Green" if pd.notna(value) and value >= threshold else ("Amber" if pd.notna(value) else "Unavailable"))
     return table
+
+
+def top_product_price_table(product_price_json: str, pat_table: pd.DataFrame, market: str) -> tuple[pd.DataFrame, str]:
+    """Join disclosed top-three product price series with PAT growth by fiscal year."""
+    try:
+        payload = json.loads(product_price_json.removeprefix("```json").removesuffix("```").strip())
+    except (json.JSONDecodeError, AttributeError):
+        return pd.DataFrame(), "The official-report product-price response could not be read."
+    products = payload.get("products", []) if isinstance(payload, dict) else []
+    rows = []
+    pat_by_fy = pat_table.set_index("FY")["PAT % increase"].to_dict() if not pat_table.empty else {}
+    for product in products[:3]:
+        if not isinstance(product, dict):
+            continue
+        prices = product.get("prices", [])
+        cleaned = []
+        for item in prices:
+            if isinstance(item, dict) and num(item.get("price")) is not None and item.get("fy"):
+                cleaned.append((str(item["fy"])[-4:], float(item["price"]), str(item.get("page", ""))))
+        for index, (fy, price, page) in enumerate(cleaned):
+            previous = cleaned[index - 1][1] if index else None
+            price_change = ((price / previous) - 1) * 100 if previous not in (None, 0) else np.nan
+            pat_change = num(pat_by_fy.get(fy))
+            multiplier = pat_change / price_change if pat_change is not None and pd.notna(price_change) and price_change != 0 else np.nan
+            threshold = 2.0 if market == "India" else 1.5
+            rows.append({"Product / service": product.get("name", "Unnamed"), "FY": fy, "Disclosed price": price, "Unit": product.get("unit", "Not stated"), "Currency": product.get("currency", "Not stated"), "Price of top-3 products % rise": price_change, "PAT % increase": pat_change, "Multiplier": multiplier, "Multiplier status": "Green" if pd.notna(multiplier) and multiplier >= threshold else ("Amber" if pd.notna(multiplier) else "Unavailable"), "Official-report page": page})
+    note = str(payload.get("note", "")) if isinstance(payload, dict) else ""
+    return pd.DataFrame(rows), note
 
 
 def render() -> None:
@@ -1021,7 +1142,7 @@ def render() -> None:
 
     with st.sidebar:
         st.header("Research controls")
-        page = st.radio("Page", ["Research dashboard", "Watchlist"], label_visibility="collapsed")
+        page = st.radio("Page", ["Research dashboard", "Market calendar", "Watchlist"], label_visibility="collapsed")
         previous_market = st.session_state.market
         market = st.radio("Market", ["US", "India"], index=0 if st.session_state.market == "US" else 1)
         st.session_state.market = market
@@ -1060,6 +1181,10 @@ def render() -> None:
             st.session_state.active_ticker = selected
             st.session_state.dual_listing = "Custom ticker"
             st.rerun()
+
+    if page == "Market calendar":
+        render_market_calendar_page()
+        return
 
     if page == "Watchlist":
         st.title("Watchlist")
@@ -1107,6 +1232,7 @@ def render() -> None:
     fx_factor, fx_note = usd_conversion_factor(financial_currency)
     company = info.get("longName") or info.get("shortName") or symbol
     st.title(company)
+    render_market_call_audio()
     cache_label = "browser cache (under four hours old)" if browser_cache_hit else "provider refresh; browser cache updated"
     st.caption(f"Symbol: {symbol} | Market: {market} | Price source: {price['source']} | Fundamentals: {cache_label} | Data shown only when returned by a provider.")
     price_cache_key = f"{market}:{symbol}"
@@ -1188,8 +1314,33 @@ def render() -> None:
         st.info("NSE corporate-data API access is a paid product. These official exchange pages are provided without scraping or bypassing access controls.")
     for label, url in official_exchange_links(symbol, market).items():
         st.link_button(label, url)
+    st.subheader("Automatic official-report download")
+    report_candidate = find_latest_official_report(resolved, market, sec_data)
+    report_state_key = f"official-report:{market}:{symbol}"
+    if report_candidate.get("url"):
+        st.link_button(f"Open {report_candidate['label']}", report_candidate["url"])
+        if st.button("Auto-download latest official report and extract group data", key=f"download-report-{market}-{symbol}"):
+            with st.spinner("Downloading the official report and extracting disclosed group information..."):
+                report_text, report_error = _official_report_text(report_candidate["url"], market, secret("SEC_USER_AGENT"))
+            if report_error:
+                st.error(report_error)
+            else:
+                st.session_state[report_state_key] = {"text": report_text, "url": report_candidate["url"], "label": report_candidate["label"]}
+                st.success(f"Downloaded and extracted {len(report_text):,} characters from the official report.")
+    else:
+        st.warning(report_candidate.get("error", "Official report discovery was unavailable."))
+    auto_report = st.session_state.get(report_state_key)
+    if auto_report:
+        st.caption(f"Automatic source: {auto_report['label']}")
+        auto_group = report_group_evidence(auto_report["text"], auto_report["url"])
+        if auto_group.empty:
+            st.info("The report was downloaded, but no group-structure keywords were found in its extractable text. Review its notes on subsidiaries and related parties, or upload a searchable PDF.")
+        else:
+            st.subheader("Automatically extracted corporate-group disclosure excerpts")
+            st.dataframe(auto_group, width="stretch", hide_index=True, column_config={"Official report": st.column_config.LinkColumn("Official report")})
     uploaded = st.file_uploader("Official report upload", type=["pdf", "docx", "xlsx", "xls", "csv"], help="Only upload documents downloaded from the company or stock exchange website.")
     analysis = None
+    document_text = auto_report["text"] if auto_report else ""
     if uploaded:
         document_text, document_error = extract_uploaded_document(uploaded)
         if document_error:
@@ -1205,6 +1356,16 @@ def render() -> None:
                     progress.progress(34, text="Analyzing Litigation Ledger (2/3)...")
                     progress.progress(67, text="Calculating Bottleneck State (3/3)...")
                     progress.progress(100, text="Analysis complete.")
+    elif auto_report:
+        if st.button("Analyze downloaded official report sequentially", key=f"analyse-auto-report-{market}-{symbol}"):
+            progress = st.progress(0, text="Analyzing Corporate Web (1/3)...")
+            analysis = gemini_analysis(document_text, company, secret("GEMINI_API_KEY"), secret("GEMINI_MODEL"))
+            if analysis.get("error"):
+                st.error(analysis["error"])
+            else:
+                progress.progress(34, text="Analyzing Litigation Ledger (2/3)...")
+                progress.progress(67, text="Calculating Bottleneck State (3/3)...")
+                progress.progress(100, text="Analysis complete.")
 
     display_evidence("4. Group structure", disclosure_evidence, "No matching group-structure terms were found in the limited public source pages checked. Open the official filings above for complete disclosure.")
     if analysis and not analysis.get("error"):
@@ -1243,25 +1404,34 @@ def render() -> None:
 
     st.header("11. Past, present and forward bottleneck assessment")
     st.caption("This is a transparent, logarithmically normalised disclosed-language heuristic, not an investment recommendation or verified economic forecast.")
-    st.subheader("Five-year PAT and market-price proxy multiplier")
-    st.caption("PAT uses provider-reported net income. Product selling-price data is not a universal structured-data field, so the table uses a clearly labelled end-of-year market share-price proxy. Upload an official report if you need a disclosed product-price series. Green threshold: ≥1.5x for US; ≥2.0x for India.")
-    current_pat_table = pat_and_market_price_table(symbol, _frame_to_cache(fundamentals["income"]), market)
+    st.subheader("Five-year PAT and price of top three products / services")
+    st.caption("PAT uses provider-reported net income. Prices are accepted only when an official report explicitly discloses the price of a top product or service; company share prices are never substituted. Green multiplier threshold: ≥1.5x for US; ≥2.0x for India.")
+    current_pat_table = pat_growth_table(_frame_to_cache(fundamentals["income"]))
     if current_pat_table.empty:
         st.info("The provider did not return five-year annual net-income data for a PAT multiplier table.")
     else:
         def multiplier_style(value: Any) -> str:
             return "background-color: #166534; color: white" if value == "Green" else ("background-color: #b45309; color: white" if value == "Amber" else "")
-        st.dataframe(current_pat_table.style.map(multiplier_style, subset=["Multiplier status"]).format({"PAT (reported currency M)": "{:,.2f}", "Market share-price proxy": "{:,.2f}", "PAT % increase": "{:.2f}%", "Market share-price % rise": "{:.2f}%", "Multiplier": "{:.2f}x"}, na_rep="Unavailable"), width="stretch", hide_index=True)
+        st.dataframe(current_pat_table.style.format({"PAT (reported currency M)": "{:,.2f}", "PAT % increase": "{:.2f}%"}, na_rep="Unavailable"), width="stretch", hide_index=True)
+    if analysis and not analysis.get("error"):
+        product_prices, product_note = top_product_price_table(analysis.get("product_prices", ""), current_pat_table, market)
+        if not product_prices.empty:
+            st.subheader("Officially disclosed price history: top three products / services")
+            st.dataframe(product_prices.style.map(multiplier_style, subset=["Multiplier status"]).format({"Disclosed price": "{:,.2f}", "Price of top-3 products % rise": "{:.2f}%", "PAT % increase": "{:.2f}%", "Multiplier": "{:.2f}x"}, na_rep="Unavailable"), width="stretch", hide_index=True)
+        else:
+            st.info(product_note or "The analysed official report does not disclose a comparable historical price series for up to three products or services.")
+    else:
+        st.info("Download/upload an official annual report in Section 4 and run its analysis to populate disclosed prices for the company’s top three products or services.")
     if st.session_state.dual_listing != "Custom ticker":
         other_market = "India" if market == "US" else "US"
         other_symbol = symbol_for_market(DUAL_LISTINGS[st.session_state.dual_listing][other_market], other_market)
         other_fundamentals = yahoo_fundamentals(other_symbol)
-        other_table = pat_and_market_price_table(other_symbol, _frame_to_cache(other_fundamentals["income"]), other_market)
+        other_table = pat_growth_table(_frame_to_cache(other_fundamentals["income"]))
         st.subheader(f"Dual-listed reference: {other_market} ({other_symbol})")
         if other_table.empty:
             st.info("No usable five-year annual net-income history was returned for the other listing.")
         else:
-            st.dataframe(other_table.style.map(multiplier_style, subset=["Multiplier status"]).format({"PAT (reported currency M)": "{:,.2f}", "Market share-price proxy": "{:,.2f}", "PAT % increase": "{:.2f}%", "Market share-price % rise": "{:.2f}%", "Multiplier": "{:.2f}x"}, na_rep="Unavailable"), width="stretch", hide_index=True)
+            st.dataframe(other_table.style.format({"PAT (reported currency M)": "{:,.2f}", "PAT % increase": "{:.2f}%"}, na_rep="Unavailable"), width="stretch", hide_index=True)
     st.subheader("Relative Strength and 60-day covariance beta")
     rs_beta = calculate_stock_rs_and_beta_engine(symbol)
     if rs_beta.get("ok"):
