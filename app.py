@@ -78,10 +78,15 @@ DUAL_LISTINGS = {
     "ICICI Bank": {"US": "IBN", "India": "ICICIBANK"},
     "Dr. Reddy's Laboratories": {"US": "RDY", "India": "DRREDDY"},
 }
-INDIA_SEARCH_ALIASES = {
-    "AZAAD ENGINEERING": {"symbol": "AZAD.NS", "name": "Azad Engineering Limited", "exchange": "NSE"},
-    "AZAD ENGINEERING": {"symbol": "AZAD.NS", "name": "Azad Engineering Limited", "exchange": "NSE"},
-}
+SEARCH_SUGGESTIONS = [
+    {"market": "India", "symbol": "AZAD.NS", "name": "Azad Engineering Limited", "exchange": "NSE"},
+    {"market": "India", "symbol": "RELIANCE.NS", "name": "Reliance Industries Limited", "exchange": "NSE"},
+    {"market": "India", "symbol": "INFY.NS", "name": "Infosys Limited", "exchange": "NSE"},
+    {"market": "India", "symbol": "TCS.NS", "name": "Tata Consultancy Services Limited", "exchange": "NSE"},
+    {"market": "US", "symbol": "AAPL", "name": "Apple Inc.", "exchange": "NASDAQ"},
+    {"market": "US", "symbol": "MSFT", "name": "Microsoft Corporation", "exchange": "NASDAQ"},
+    {"market": "US", "symbol": "NVDA", "name": "NVIDIA Corporation", "exchange": "NASDAQ"},
+]
 
 for key, value in {"watchlist": [], "active_ticker": "AAPL", "market": "US", "open_ir": False, "dual_listing": "Custom ticker", "last_good_prices": {}}.items():
     if key not in st.session_state:
@@ -116,23 +121,34 @@ def display_symbol(symbol: str) -> str:
 def company_name_matches(query: str, market: str) -> list[dict[str, str]]:
     """Return real Yahoo Finance search matches for a company name or ticker."""
     if len(query.strip()) < 2:
+def company_suggestions(query: str, market: str) -> list[dict[str, str]]:
+    """Suggest known companies first, then augment with Yahoo results when available."""
+    term = " ".join(query.lower().split())
+    if len(term) < 2:
         return []
-    alias = INDIA_SEARCH_ALIASES.get(" ".join(query.upper().split())) if market == "India" else None
-    matches = [alias] if alias else []
+    suggestions = [
+        {"symbol": item["symbol"], "name": item["name"], "exchange": item["exchange"]}
+        for item in SEARCH_SUGGESTIONS
+        if item["market"] == market and (term in item["name"].lower() or term in item["symbol"].lower())
+    ]
+    quotes: list[dict[str, Any]] = []
     try:
         quotes = yf.Search(query.strip(), max_results=15, news_count=0).quotes or []
+        quotes = yf.Search(query.strip(), max_results=12, news_count=0).quotes or []
     except Exception:
         return []
     matches = []
     seen = set()
-        return matches
-    seen = {match["symbol"] for match in matches}
+        quotes = []
+    seen = {item["symbol"] for item in suggestions}
     for quote in quotes:
         symbol = str(quote.get("symbol", "")).upper()
         name = str(quote.get("longname") or quote.get("shortname") or "")
         exchange = str(quote.get("exchDisp") or quote.get("exchange") or "")
         country = str(quote.get("country") or "")
         if not symbol or symbol in seen or quote.get("quoteType") not in {"EQUITY", "MUTUALFUND", None}:
+        is_india = symbol.endswith((".NS", ".BO")) or country.lower() == "india" or "nse" in exchange.lower() or "bse" in exchange.lower()
+        if not symbol or symbol in seen or (market == "India" and not is_india) or (market == "US" and is_india):
             continue
         india_match = symbol.endswith(".NS") or country.lower() == "india" or "nse" in exchange.lower()
         if (market == "India" and not india_match) or (market == "US" and india_match):
@@ -140,6 +156,8 @@ def company_name_matches(query: str, market: str) -> list[dict[str, str]]:
         seen.add(symbol)
         matches.append({"symbol": symbol, "name": name or symbol, "exchange": exchange or "Unavailable"})
     return matches
+        suggestions.append({"symbol": symbol, "name": name or symbol, "exchange": exchange or "Unavailable"})
+    return suggestions[:15]
 
 
 def num(value: Any) -> float | None:
@@ -1268,6 +1286,7 @@ def render() -> None:
         st.subheader("Company-name search")
         name_query = st.text_input("Search company name", placeholder="Example: Apple, Infosys, Reliance")
         possible_matches = company_name_matches(name_query, market)
+        possible_matches = company_suggestions(name_query, market)
         if name_query.strip():
             if possible_matches:
                 labels = [f"{match['name']} — {match['symbol']} ({match['exchange']})" for match in possible_matches]
