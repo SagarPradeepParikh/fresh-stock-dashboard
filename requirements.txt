@@ -11,4 +11,4 @@ python-docx>=1.1
 openpyxl>=3.1
 google-genai>=1.0
 streamlit-local-storage>=0.0.16
-GEMINI_GROUNDED_MODEL = "gemini-2.5-flash"
+
