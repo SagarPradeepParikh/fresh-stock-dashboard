@@ -4,6 +4,7 @@ from __future__ import annotations
 import datetime as dt
 import base64
 import calendar
+from difflib import SequenceMatcher
 import hashlib
 import io
 import json
@@ -118,15 +119,61 @@ def display_symbol(symbol: str) -> str:
 
 
 @st.cache_data(ttl=900, show_spinner=False)
+def company_name_matches(query: str, market: str) -> list[dict[str, str]]:
+    """Return real Yahoo Finance search matches for a company name or ticker."""
+    if len(query.strip()) < 2:
 def company_suggestions(query: str, market: str) -> list[dict[str, str]]:
-    """Provide a reliable built-in company-name suggestion list."""
+    """Return nearest local suggestions plus available live Yahoo matches."""
     raw_term = " ".join(query.lower().split())
-    term = raw_term or "__empty_search__"
-    return [
-        {"symbol": item["symbol"], "name": item["name"], "exchange": item["exchange"]}
-        for item in SEARCH_SUGGESTIONS
-        if item["market"] == market and (term in item["name"].lower() or term in item["symbol"].lower())
-    ][:15]
+    if len(raw_term) < 2:
+        return []
+    universe = US_UNIVERSE if market == "US" else INDIA_UNIVERSE
+    local_catalog = list(SEARCH_SUGGESTIONS)
+    for symbols in universe.values():
+        for symbol in symbols:
+            listed_symbol = symbol if market == "US" else f"{symbol}.NS"
+            local_catalog.append({"market": market, "symbol": listed_symbol, "name": symbol, "exchange": "NASDAQ/NYSE" if market == "US" else "NSE"})
+    ranked = []
+    for item in local_catalog:
+        if item["market"] != market:
+            continue
+        searchable = f"{item['name']} {item['symbol']}".lower()
+        score = 1.0 if raw_term in searchable else SequenceMatcher(None, raw_term, searchable).ratio()
+        if score >= 0.25:
+            ranked.append((score, {"symbol": item["symbol"], "name": item["name"], "exchange": item["exchange"]}))
+    ranked.sort(key=lambda pair: pair[0], reverse=True)
+    suggestions = [item for _, item in ranked]
+    seen = {item["symbol"] for item in suggestions}
+    try:
+        quotes = yf.Search(query.strip(), max_results=15, news_count=0).quotes or []
+        live_quotes = yf.Search(query.strip(), max_results=12, news_count=0).quotes or []
+    except Exception:
+        return []
+    matches = []
+    seen = set()
+    for quote in quotes:
+        live_quotes = []
+    for quote in live_quotes:
+        symbol = str(quote.get("symbol", "")).upper()
+        name = str(quote.get("longname") or quote.get("shortname") or "")
+        exchange = str(quote.get("exchDisp") or quote.get("exchange") or "")
+        country = str(quote.get("country") or "")
+        if not symbol or symbol in seen or quote.get("quoteType") not in {"EQUITY", "MUTUALFUND", None}:
+            continue
+        india_match = symbol.endswith(".NS") or country.lower() == "india" or "nse" in exchange.lower()
+        if (market == "India" and not india_match) or (market == "US" and india_match):
+            continue
+        seen.add(symbol)
+        matches.append({"symbol": symbol, "name": name or symbol, "exchange": exchange or "Unavailable"})
+    return matches
+        name = str(quote.get("longname") or quote.get("shortname") or symbol)
+        exchange = str(quote.get("exchDisp") or quote.get("exchange") or "Unavailable")
+        country = str(quote.get("country") or "").lower()
+        indian_listing = symbol.endswith((".NS", ".BO")) or country == "india" or "nse" in exchange.lower() or "bse" in exchange.lower()
+        if symbol and symbol not in seen and ((market == "India" and indian_listing) or (market == "US" and not indian_listing)):
+            suggestions.append({"symbol": symbol, "name": name, "exchange": exchange})
+            seen.add(symbol)
+    return suggestions[:15]
 
 
 def num(value: Any) -> float | None:
@@ -362,6 +409,14 @@ def next_30_day_market_calendar(market: str) -> pd.DataFrame:
 
 def render_market_calendar_page() -> None:
     st.title("Market calendar: next 30 days")
+    calendar_market = st.radio("Calendar market", ["US", "India"], horizontal=True)
+    st.caption("Exchange sessions are based on the NYSE or NSE calendar. Confirm exceptional closures and special sessions with the official exchange notice.")
+    calendar_data = next_30_day_market_calendar(calendar_market)
+    st.dataframe(calendar_data, width="stretch", hide_index=True, column_config={"Date": st.column_config.DateColumn("Date", format="DD MMM YYYY")})
+    for status, color in (("OPEN", "#166534"), ("CLOSED", "#991b1b")):
+        matching = calendar_data.loc[calendar_data["Market status"] == status]
+        if not matching.empty:
+            st.markdown(f"<span style='color:{color}; font-weight:700'>{status}: {len(matching)} day(s)</span>", unsafe_allow_html=True)
     view = st.radio("Calendar view", ["Both markets", "US", "India"], horizontal=True)
     st.caption("Green dot = regular session scheduled. Red dot = closed. The calendar covers today through the next 30 days; dates beyond that range are muted. Confirm exceptional closures with the official exchange notice.")
 
@@ -1246,11 +1301,13 @@ def render() -> None:
         st.caption("Select a dual-listed company, then switch market to load its US ticker/ADR or Indian NSE ticker.")
         st.subheader("Company-name search")
         name_query = st.text_input("Search company name", placeholder="Example: Apple, Infosys, Reliance")
+        possible_matches = company_name_matches(name_query, market)
         possible_matches = company_suggestions(name_query, market)
         if name_query.strip():
             if possible_matches:
                 labels = [f"{match['name']} — {match['symbol']} ({match['exchange']})" for match in possible_matches]
                 selected_label = st.selectbox("Possible matches", labels)
+                selected_label = st.selectbox("Live / closest company suggestions", labels)
                 chosen_match = possible_matches[labels.index(selected_label)]
                 if st.button("Load company match", width="stretch"):
                     st.session_state.active_ticker = display_symbol(chosen_match["symbol"])
@@ -1258,6 +1315,7 @@ def render() -> None:
                     st.rerun()
             else:
                 st.info("No matching listed instruments were returned by Yahoo Finance for this market.")
+                st.info("No nearby company suggestion is available yet. Enter the ticker directly below.")
         universe = US_UNIVERSE if market == "US" else INDIA_UNIVERSE
         tier = st.selectbox("Company size", list(universe))
         selected = st.selectbox("Top-ten selection", universe[tier])
@@ -1502,6 +1560,8 @@ def render() -> None:
         def multiplier_style(value: Any) -> str:
             return "background-color: #166534; color: white" if value == "Green" else ("background-color: #b45309; color: white" if value == "Amber" else "")
         st.dataframe(current_pat_table.style.format({"PAT (reported currency M)": "{:,.2f}", "PAT % increase": "{:.2f}%"}, na_rep="Unavailable"), width="stretch", hide_index=True)
+    if analysis and not analysis.get("error"):
+        product_prices, product_note = top_product_price_table(analysis.get("product_prices", ""), current_pat_table, market)
     web_product_key = f"web-product-prices:{market}:{symbol}"
     if st.button("Research top-three product/service prices with Gemini web search", key=f"web-product-button:{market}:{symbol}"):
         with st.spinner("Gemini is searching cited public web sources for comparable product/service pricing..."):
@@ -1515,6 +1575,8 @@ def render() -> None:
     if product_json:
         product_prices, product_note = top_product_price_table(product_json, current_pat_table, market)
         if not product_prices.empty:
+            st.subheader("Officially disclosed price history: top three products / services")
+            st.dataframe(product_prices.style.map(multiplier_style, subset=["Multiplier status"]).format({"Disclosed price": "{:,.2f}", "Price of top-3 products % rise": "{:.2f}%", "PAT % increase": "{:.2f}%", "Multiplier": "{:.2f}x"}, na_rep="Unavailable"), width="stretch", hide_index=True)
             st.subheader("Cited price history: top three products / services")
             product_matrix = product_price_year_matrix(product_prices)
             st.dataframe(product_matrix.style.map(multiplier_style, subset=[column for column in product_matrix.columns if column not in {"Product / service", "Metric"}]), width="stretch", hide_index=True)
@@ -1525,6 +1587,7 @@ def render() -> None:
             st.caption("Gemini web-search sources used for this product/service research")
             st.dataframe(pd.DataFrame(citations), width="stretch", hide_index=True, column_config={"URL": st.column_config.LinkColumn("Open source")})
     else:
+        st.info("Download/upload an official annual report in Section 4 and run its analysis to populate disclosed prices for the company’s top three products or services.")
         st.info("Use the Gemini web-search button above, or analyze an official report from Section 4, to populate source-backed prices for the company’s top three products or services.")
     if st.session_state.dual_listing != "Custom ticker":
         other_market = "India" if market == "US" else "US"
