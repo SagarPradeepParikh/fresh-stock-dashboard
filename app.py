@@ -78,6 +78,10 @@ DUAL_LISTINGS = {
     "ICICI Bank": {"US": "IBN", "India": "ICICIBANK"},
     "Dr. Reddy's Laboratories": {"US": "RDY", "India": "DRREDDY"},
 }
+INDIA_SEARCH_ALIASES = {
+    "AZAAD ENGINEERING": {"symbol": "AZAD.NS", "name": "Azad Engineering Limited", "exchange": "NSE"},
+    "AZAD ENGINEERING": {"symbol": "AZAD.NS", "name": "Azad Engineering Limited", "exchange": "NSE"},
+}
 
 for key, value in {"watchlist": [], "active_ticker": "AAPL", "market": "US", "open_ir": False, "dual_listing": "Custom ticker", "last_good_prices": {}}.items():
     if key not in st.session_state:
@@ -113,12 +117,16 @@ def company_name_matches(query: str, market: str) -> list[dict[str, str]]:
     """Return real Yahoo Finance search matches for a company name or ticker."""
     if len(query.strip()) < 2:
         return []
+    alias = INDIA_SEARCH_ALIASES.get(" ".join(query.upper().split())) if market == "India" else None
+    matches = [alias] if alias else []
     try:
         quotes = yf.Search(query.strip(), max_results=15, news_count=0).quotes or []
     except Exception:
         return []
     matches = []
     seen = set()
+        return matches
+    seen = {match["symbol"] for match in matches}
     for quote in quotes:
         symbol = str(quote.get("symbol", "")).upper()
         name = str(quote.get("longname") or quote.get("shortname") or "")
@@ -375,6 +383,44 @@ def render_market_calendar_page() -> None:
         matching = calendar_data.loc[calendar_data["Market status"] == status]
         if not matching.empty:
             st.markdown(f"<span style='color:{color}; font-weight:700'>{status}: {len(matching)} day(s)</span>", unsafe_allow_html=True)
+    view = st.radio("Calendar view", ["Both markets", "US", "India"], horizontal=True)
+    st.caption("Green dot = regular session scheduled. Red dot = closed. The calendar covers today through the next 30 days; dates beyond that range are muted. Confirm exceptional closures with the official exchange notice.")
+
+    def month_html(market: str, data: pd.DataFrame, year: int, month: int) -> str:
+        status_by_day = {pd.Timestamp(row["Date"]).date(): row["Market status"] for _, row in data.iterrows()}
+        start, end = dt.date.today(), dt.date.today() + dt.timedelta(days=30)
+        cells = "".join("<div class='cal-weekday'>" + day + "</div>" for day in ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"))
+        for week in calendar.monthcalendar(year, month):
+            for number in week:
+                if number == 0:
+                    cells += "<div class='cal-day empty'></div>"
+                    continue
+                day = dt.date(year, month, number)
+                if not start <= day <= end:
+                    cells += f"<div class='cal-day muted'><span>{number}</span></div>"
+                else:
+                    state = status_by_day.get(day, "CLOSED")
+                    color = "#22c55e" if state == "OPEN" else "#ef4444"
+                    cells += f"<div class='cal-day'><span>{number}</span><i title='{state}' style='background:{color}'></i></div>"
+        return f"<div class='cal-card'><h3>{market} — {calendar.month_name[month]} {year}</h3><div class='cal-grid'>{cells}</div></div>"
+
+    markets = ["US", "India"] if view == "Both markets" else [view]
+    today = dt.date.today()
+    next_month = 1 if today.month == 12 else today.month + 1
+    next_year = today.year + 1 if today.month == 12 else today.year
+    st.markdown("""<style>
+    .cal-card {background:rgba(12,20,47,.86);border:1px solid #334155;border-radius:14px;padding:14px;margin:8px 0 18px;}
+    .cal-card h3 {margin:0 0 12px;font-size:1.05rem}.cal-grid {display:grid;grid-template-columns:repeat(7,1fr);gap:5px}
+    .cal-weekday {font-size:.72rem;color:#94a3b8;text-align:center}.cal-day {position:relative;min-height:40px;border-radius:8px;padding:6px;background:rgba(51,65,85,.42)}
+    .cal-day i {position:absolute;right:6px;top:6px;width:8px;height:8px;border-radius:50%}.cal-day.muted {opacity:.28}.cal-day.empty {background:transparent}
+    </style>""", unsafe_allow_html=True)
+    columns = st.columns(len(markets))
+    for column, market in zip(columns, markets):
+        data = next_30_day_market_calendar(market)
+        with column:
+            st.markdown(month_html(market, data, today.year, today.month), unsafe_allow_html=True)
+            if (next_year, next_month) != (today.year, today.month):
+                st.markdown(month_html(market, data, next_year, next_month), unsafe_allow_html=True)
 
 
 def render_market_call_audio() -> None:
@@ -1124,6 +1170,70 @@ def top_product_price_table(product_price_json: str, pat_table: pd.DataFrame, ma
     return pd.DataFrame(rows), note
 
 
+def gemini_grounded_product_price_research(company: str, market: str, api_key: str | None, model: str | None) -> tuple[str, list[dict[str, str]], str | None]:
+    """Use Gemini Google Search grounding for cited product-price research.
+
+    This does not scrape retailer pages directly. Gemini's managed search is
+    asked to cite the pages it actually used, and missing historical prices are
+    returned as missing rather than estimated.
+    """
+    if not api_key:
+        return "", [], "Add GEMINI_API_KEY to Streamlit secrets to run web-grounded product-price research."
+    prompt = f"""Research up to three principal products or services of {company} ({market} listed company) using current public web sources. Prioritise the company website, annual reports, product catalogues and reputable financial sources. You may use publicly indexed retailer/listing pages such as Amazon, Flipkart, or eBay only when the listing clearly identifies the same product, date and currency. Do not scrape or bypass access controls.
+
+Return valid JSON only using this exact schema:
+{{"products":[{{"name":string,"unit":string,"currency":string,"prices":[{{"fy":string,"price":number,"page":string}}]}}],"note":string}}
+
+Include no more than five fiscal years. Include a price only when its date/FY, unit, currency and source support comparison. Do not use company share prices, do not infer a product price from revenue, and do not fabricate historical values. If a comparable five-year product-price series is not publicly available, return an empty prices list for that product and explain the limitation in note."""
+    try:
+        from google import genai
+        from google.genai import types
+        client = genai.Client(api_key=api_key)
+        grounding = types.Tool(google_search=types.GoogleSearch())
+        response = client.models.generate_content(
+            model=model or "gemini-2.5-flash",
+            contents=prompt,
+            config=types.GenerateContentConfig(tools=[grounding]),
+        )
+        citations = []
+        metadata = getattr(getattr(response, "candidates", [None])[0], "grounding_metadata", None) if getattr(response, "candidates", None) else None
+        for chunk in getattr(metadata, "grounding_chunks", []) or []:
+            web = getattr(chunk, "web", None)
+            url = getattr(web, "uri", None) if web else None
+            title = getattr(web, "title", None) if web else None
+            if url:
+                citations.append({"Source": title or "Web source", "URL": url})
+        return response.text or "", citations[:12], None
+    except Exception as exc:
+        return "", [], f"Gemini web-grounded product-price research failed: {exc}"
+
+
+def business_product_or_service_clues(summary: str) -> list[str]:
+    """Return issuer-description excerpts; this does not guess commodities or prices."""
+    sentences = re.split(r"(?<=[.!?])\s+", re.sub(r"\s+", " ", summary or ""))
+    clues = [sentence for sentence in sentences if any(word in sentence.lower() for word in ("product", "service", "manufactur", "produce", "component", "solution", "platform"))]
+    return clues[:3]
+
+
+def product_price_year_matrix(long_table: pd.DataFrame) -> pd.DataFrame:
+    """Present each top product with fiscal years as columns for Section 11."""
+    if long_table.empty:
+        return pd.DataFrame()
+    years = sorted(long_table["FY"].dropna().astype(str).unique())
+    rows = []
+    for product, group in long_table.groupby("Product / service", sort=False):
+        ordered = group.drop_duplicates(subset=["FY"], keep="last").set_index("FY")
+        for metric, column, formatter in (
+            ("Disclosed price", "Disclosed price", lambda value: f"{value:,.2f}" if pd.notna(value) else "Unavailable"),
+            ("Price rise %", "Price of top-3 products % rise", lambda value: f"{value:.2f}%" if pd.notna(value) else "Unavailable"),
+            ("PAT increase %", "PAT % increase", lambda value: f"{value:.2f}%" if pd.notna(value) else "Unavailable"),
+            ("Multiplier", "Multiplier", lambda value: f"{value:.2f}x" if pd.notna(value) else "Unavailable"),
+            ("Multiplier status", "Multiplier status", lambda value: str(value) if pd.notna(value) else "Unavailable"),
+        ):
+            rows.append({"Product / service": product, "Metric": metric, **{year: formatter(ordered.at[year, column]) if year in ordered.index else "Unavailable" for year in years}})
+    return pd.DataFrame(rows)
+
+
 def render() -> None:
     clocks = market_clock()
     a, b = st.columns(2)
@@ -1415,13 +1525,33 @@ def render() -> None:
         st.dataframe(current_pat_table.style.format({"PAT (reported currency M)": "{:,.2f}", "PAT % increase": "{:.2f}%"}, na_rep="Unavailable"), width="stretch", hide_index=True)
     if analysis and not analysis.get("error"):
         product_prices, product_note = top_product_price_table(analysis.get("product_prices", ""), current_pat_table, market)
+    web_product_key = f"web-product-prices:{market}:{symbol}"
+    if st.button("Research top-three product/service prices with Gemini web search", key=f"web-product-button:{market}:{symbol}"):
+        with st.spinner("Gemini is searching cited public web sources for comparable product/service pricing..."):
+            product_json, product_citations, product_error = gemini_grounded_product_price_research(company, market, secret("GEMINI_API_KEY"), secret("GEMINI_GROUNDED_MODEL"))
+        if product_error:
+            st.error(product_error)
+        else:
+            st.session_state[web_product_key] = {"json": product_json, "citations": product_citations}
+    web_product_result = st.session_state.get(web_product_key, {})
+    product_json = str(web_product_result.get("json") or (analysis.get("product_prices", "") if analysis and not analysis.get("error") else ""))
+    if product_json:
+        product_prices, product_note = top_product_price_table(product_json, current_pat_table, market)
         if not product_prices.empty:
             st.subheader("Officially disclosed price history: top three products / services")
             st.dataframe(product_prices.style.map(multiplier_style, subset=["Multiplier status"]).format({"Disclosed price": "{:,.2f}", "Price of top-3 products % rise": "{:.2f}%", "PAT % increase": "{:.2f}%", "Multiplier": "{:.2f}x"}, na_rep="Unavailable"), width="stretch", hide_index=True)
+            st.subheader("Cited price history: top three products / services")
+            product_matrix = product_price_year_matrix(product_prices)
+            st.dataframe(product_matrix.style.map(multiplier_style, subset=[column for column in product_matrix.columns if column not in {"Product / service", "Metric"}]), width="stretch", hide_index=True)
         else:
             st.info(product_note or "The analysed official report does not disclose a comparable historical price series for up to three products or services.")
+        citations = web_product_result.get("citations", [])
+        if citations:
+            st.caption("Gemini web-search sources used for this product/service research")
+            st.dataframe(pd.DataFrame(citations), width="stretch", hide_index=True, column_config={"URL": st.column_config.LinkColumn("Open source")})
     else:
         st.info("Download/upload an official annual report in Section 4 and run its analysis to populate disclosed prices for the company’s top three products or services.")
+        st.info("Use the Gemini web-search button above, or analyze an official report from Section 4, to populate source-backed prices for the company’s top three products or services.")
     if st.session_state.dual_listing != "Custom ticker":
         other_market = "India" if market == "US" else "US"
         other_symbol = symbol_for_market(DUAL_LISTINGS[st.session_state.dual_listing][other_market], other_market)
@@ -1432,6 +1562,23 @@ def render() -> None:
             st.info("No usable five-year annual net-income history was returned for the other listing.")
         else:
             st.dataframe(other_table.style.format({"PAT (reported currency M)": "{:,.2f}", "PAT % increase": "{:.2f}%"}, na_rep="Unavailable"), width="stretch", hide_index=True)
+    st.subheader("RS/Beta inputs and relevant product / service context")
+    st.caption("Commodity or product prices are not used to calculate RS or beta. RS uses the selected stock’s adjusted daily closes and its market benchmark; beta uses their 60-day daily-return covariance. Product/service prices above are shown separately only when officially disclosed.")
+    input_col, business_col = st.columns(2)
+    with input_col:
+        st.dataframe(pd.DataFrame([
+            {"Input": "Selected security price series", "Used for": f"40/20/20/20 RS and 60-day beta — {symbol}"},
+            {"Input": "Benchmark price series", "Used for": "NIFTY 50 (^NSEI)" if market == "India" else "S&P 500 (^GSPC)"},
+            {"Input": "Commodity / product prices", "Used for": "Not an RS/Beta input"},
+        ]), width="stretch", hide_index=True)
+    with business_col:
+        clues = business_product_or_service_clues(str(info.get("longBusinessSummary") or ""))
+        if clues:
+            st.write("Issuer-described products/services:")
+            for clue in clues:
+                st.write(f"• {clue}")
+        else:
+            st.info("The provider did not return a usable business description. The official annual report is the source for unique products/services.")
     st.subheader("Relative Strength and 60-day covariance beta")
     rs_beta = calculate_stock_rs_and_beta_engine(symbol)
     if rs_beta.get("ok"):
