@@ -1,4 +1,3 @@
-
 """Evidence-first India/US equity research dashboard for Streamlit Cloud."""
 from __future__ import annotations
 
@@ -81,6 +80,7 @@ DUAL_LISTINGS = {
 }
 SEARCH_SUGGESTIONS = [
     {"market": "India", "symbol": "AZAD.NS", "name": "Azad Engineering Limited", "exchange": "NSE"},
+    {"market": "India", "symbol": "FELIX.NS", "name": "Felix Industries Limited", "exchange": "NSE SME"},
     {"market": "India", "symbol": "RELIANCE.NS", "name": "Reliance Industries Limited", "exchange": "NSE"},
     {"market": "India", "symbol": "INFY.NS", "name": "Infosys Limited", "exchange": "NSE"},
     {"market": "India", "symbol": "TCS.NS", "name": "Tata Consultancy Services Limited", "exchange": "NSE"},
@@ -88,6 +88,20 @@ SEARCH_SUGGESTIONS = [
     {"market": "US", "symbol": "MSFT", "name": "Microsoft Corporation", "exchange": "NASDAQ"},
     {"market": "US", "symbol": "NVDA", "name": "NVIDIA Corporation", "exchange": "NASDAQ"},
 ]
+ISSUER_OVERRIDES = {
+    "FELIX.NS": {
+        "longName": "Felix Industries Limited",
+        "shortName": "Felix Industries Limited",
+        "website": "https://www.felixindustries.co/",
+        "fullExchangeName": "NSE SME",
+        "exchange": "NSE",
+        "country": "India",
+        "city": "Ahmedabad",
+        "sector": "Industrials",
+        "industry": "Environmental engineering and waste management",
+        "longBusinessSummary": "Felix Industries Limited provides water and wastewater treatment and recycling systems, industrial piping solutions, e-waste recycling systems, and environmental conservation technologies.",
+    },
+}
 
 for key, value in {"watchlist": [], "active_ticker": "AAPL", "market": "US", "open_ir": False, "dual_listing": "Custom ticker", "last_good_prices": {}}.items():
     if key not in st.session_state:
@@ -1360,6 +1374,10 @@ def render() -> None:
         price["history"] = chart_history
     fundamentals, browser_cache_hit = browser_cached_fundamentals(symbol)
     info = fundamentals["info"]
+    # Some NSE SME instruments have incomplete Yahoo metadata. Official issuer
+    # details in this small registry fill only missing fields; provider values
+    # still take precedence whenever they are returned.
+    info = {**ISSUER_OVERRIDES.get(symbol, {}), **fundamentals["info"]}
     sec_data = sec_company_data(symbol, secret("SEC_USER_AGENT")) if market == "US" else None
     currency = info.get("currency") or ("INR" if market == "India" else "USD")
     financial_currency = info.get("financialCurrency") or currency
