@@ -1203,23 +1203,21 @@ Return valid JSON only using this exact schema:
 Include no more than five fiscal years. Include a price only when its date/FY, unit, currency and source support comparison. Do not use company share prices, do not infer a product price from revenue, and do not fabricate historical values. If a comparable five-year product-price series is not publicly available, return an empty prices list for that product and explain the limitation in note."""
     try:
         from google import genai
-        from google.genai import types
         client = genai.Client(api_key=api_key)
-        grounding = types.Tool(google_search=types.GoogleSearch())
-        response = client.models.generate_content(
-            model=model or "gemini-2.5-flash",
-            contents=prompt,
-            config=types.GenerateContentConfig(tools=[grounding]),
+        interaction = client.interactions.create(
+            model=model or "gemini-3.6-flash",
+            input=prompt,
+            tools=[{"type": "google_search"}],
         )
         citations = []
-        metadata = getattr(getattr(response, "candidates", [None])[0], "grounding_metadata", None) if getattr(response, "candidates", None) else None
-        for chunk in getattr(metadata, "grounding_chunks", []) or []:
-            web = getattr(chunk, "web", None)
-            url = getattr(web, "uri", None) if web else None
-            title = getattr(web, "title", None) if web else None
-            if url:
-                citations.append({"Source": title or "Web source", "URL": url})
-        return response.text or "", citations[:12], None
+        for step in getattr(interaction, "steps", []) or []:
+            if getattr(step, "type", "") != "model_output":
+                continue
+            for block in getattr(step, "content", []) or []:
+                for annotation in getattr(block, "annotations", []) or []:
+                    if getattr(annotation, "type", "") == "url_citation" and getattr(annotation, "url", None):
+                        citations.append({"Source": getattr(annotation, "title", None) or "Web source", "URL": annotation.url})
+        return getattr(interaction, "output_text", "") or "", citations[:12], None
     except Exception as exc:
         return "", [], f"Gemini web-grounded product-price research failed: {exc}"
 
